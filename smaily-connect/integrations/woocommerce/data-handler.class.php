@@ -90,9 +90,13 @@ class Data_Handler {
 					}
 					break;
 				case 'user_gender':
-					$gender = $meta['user_gender'][0] ?? '';
-					if ( ! empty( $gender ) ) {
-						$user_sync_data['user_gender'] = $gender === '0' ? 'Female' : 'Male';
+					$gender     = $meta['user_gender'][0] ?? '';
+					$gender_map = array(
+						'1' => 'Male',
+						'2' => 'Female',
+					);
+					if ( isset( $gender_map[ $gender ] ) ) {
+						$user_sync_data['user_gender'] = $gender_map[ $gender ];
 					}
 					break;
 				case 'site_title':
@@ -105,7 +109,10 @@ class Data_Handler {
 					// 2014-03-28 to YYYY-MM-DD format.
 					$birthday = $meta['user_dob'][0] ?? '';
 					if ( ! empty( $birthday ) ) {
-						$user_sync_data['birthday'] = gmdate( 'Y-m-d', strtotime( $birthday ) );
+						$timestamp = strtotime( $birthday );
+						if ( $timestamp !== false ) {
+							$user_sync_data['birthday'] = gmdate( 'Y-m-d', $timestamp );
+						}
 					}
 					break;
 				case 'first_name':

@@ -2,6 +2,10 @@
 
 namespace Smaily_Connect\Blocks\Checkout_Optin;
 
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
 use Smaily_Connect\Includes\Options;
 use Automattic\WooCommerce\Blocks\Integrations\IntegrationInterface;
 
@@ -91,7 +95,7 @@ class Integration implements IntegrationInterface {
 	public function register_frontend_scripts() {
 		$script_path       = '/build/smaily-checkout-optin-block-frontend.js';
 		$script_url        = plugins_url( $script_path, __FILE__ );
-		$script_asset_path = __DIR__ . '/build/newsletter-block-frontend.asset.php';
+		$script_asset_path = __DIR__ . '/build/smaily-checkout-optin-block-frontend.asset.php';
 		$script_asset      = file_exists( $script_asset_path )
 			? require $script_asset_path
 			: array(

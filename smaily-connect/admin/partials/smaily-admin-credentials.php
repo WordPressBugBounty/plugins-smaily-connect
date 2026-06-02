@@ -32,13 +32,16 @@ $connected = $subdomain && $username;
 		</label>
 		<small class="form-text text-muted">
 			<?php
-			printf(
-				/* translators: 1: example subdomain between strong tags */
-				esc_html__(
-					'For example "%1$s" from https://%1$s.sendsmaily.net/',
-					'smaily-connect'
+			echo wp_kses(
+				sprintf(
+					/* translators: 1: example subdomain wrapped in strong tags */
+					__(
+						'For example "%1$s" from https://%1$s.sendsmaily.net/',
+						'smaily-connect'
+					),
+					'<strong>demo</strong>'
 				),
-				'<strong>demo</strong>'
+				array( 'strong' => array() )
 			);
 			?>
 		</small>
@@ -63,9 +66,6 @@ $connected = $subdomain && $username;
 		<label for="smaily_password">
 			<?php esc_html_e( 'API Password', 'smaily-connect' ); ?>*
 			<input
-				<?php if ( ! empty( $password ) ) : ?>
-					disabled
-				<?php endif; ?>
 				required
 				class="regular-text code"
 				id="smaily_password"

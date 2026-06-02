@@ -191,7 +191,7 @@ class Newsletter_Widget extends Widget_Base {
 				<input
 					type="hidden"
 					name="failure_url"
-					value="<?php echo ! empty( $parameters['success_url'] ) ? esc_url( $parameters['success_url'] ) : esc_url( $current_url ); ?>"
+					value="<?php echo ! empty( $parameters['failure_url'] ) ? esc_url( $parameters['failure_url'] ) : esc_url( $current_url ); ?>"
 				>
 				<?php foreach ( $parameters['custom_hidden_fields'] as $custom_hidden_field ) : ?>
 					<?php
@@ -285,7 +285,7 @@ class Newsletter_Widget extends Widget_Base {
 				</div>
 				<# } #>
 			</div>
-			<form class="smaily-connect-elementor-newsletter-form"">
+			<form class="smaily-connect-elementor-newsletter-form">
 				<div class="smaily-connect-elementor-newsletter-form-visible-fields">
 					<div class="smaily-connect-elementor-newsletter-form-input-container">
 						<label for="smaily-connect-elementor-newsletter-form-email">
