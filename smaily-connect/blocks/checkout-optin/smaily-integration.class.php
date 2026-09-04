@@ -2,9 +2,7 @@
 
 namespace Smaily_Connect\Blocks\Checkout_Optin;
 
-if ( ! defined( 'ABSPATH' ) ) {
-	exit;
-}
+defined( 'ABSPATH' ) || exit;
 
 use Smaily_Connect\Includes\Options;
 use Automattic\WooCommerce\Blocks\Integrations\IntegrationInterface;
@@ -131,7 +129,7 @@ class Integration implements IntegrationInterface {
 	 */
 	protected function get_file_version( $file ) {
 		if ( defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG && file_exists( $file ) ) {
-			return filemtime( $file );
+			return (string) filemtime( $file );
 		}
 		return SMAILY_CHECKOUT_OPTIN_VERSION;
 	}

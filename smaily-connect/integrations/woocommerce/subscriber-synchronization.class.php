@@ -2,10 +2,9 @@
 
 namespace Smaily_Connect\Integrations\WooCommerce;
 
-if ( ! defined( 'ABSPATH' ) ) {
-	exit;
-}
+defined( 'ABSPATH' ) || exit;
 
+use Smaily\Connect\Smaily\SubscriberPayloadBuilder;
 use Smaily_Connect\Blocks\Checkout_Optin\Extend_Store_Endpoint;
 use Smaily_Connect\Includes\Helper;
 use Smaily_Connect\Includes\Logger;
@@ -100,7 +99,7 @@ class Subscriber_Synchronization {
 	/**
 	 * Make API call with subscriber data when customer account account details are updated.
 	 *
-	 * @param int $customer_ir ID of the customer.
+	 * @param int $customer_id ID of the customer.
 	 * @return void
 	 */
 	public function smaily_wc_newsletter_subscribe_update( $customer_id ) {
@@ -167,13 +166,16 @@ class Subscriber_Synchronization {
 	 * @return void
 	 */
 	private function order_optin_subscriber( WC_Order $order ) {
-		$sync_options        = get_option( Options::SUBSCRIBER_SYNC_FIELDS_OPTION, Options::SUBSCRIBER_SYNC_DEFAULT_FIELDS );
-		$enabled_sync_fields = array_keys( array_filter( $sync_options ) );
+		// Read through the sync's own interpreter — the selection has two stored
+		// shapes and reading it as a map only left a wizard-configured store
+		// matching nothing at all (PRO-1743).
+		$enabled_sync_fields = SubscriberPayloadBuilder::effective_selection_legacy_keys();
 
 		// Order is made by a registered user.
 		$user_id = $order->get_customer_id();
 		if ( $user_id !== 0 ) {
-			return $this->update_subscriber( $user_id );
+			$this->update_subscriber( $user_id );
+			return;
 		}
 
 		// Order is made by a guest user.
@@ -213,15 +215,18 @@ class Subscriber_Synchronization {
 		$request  = new Smaily_Client( $this->options );
 		$response = $request->update_subscribers( $posted_data );
 		if ( empty( $response ) ) {
-			return $this->logger->error( sprintf( 'Failed to subscribe customer during checkout. The order with id "%d" failed with unknown error.', $order->get_id() ) );
+			$this->logger->error( sprintf( 'Failed to subscribe customer during checkout. The order with id "%d" failed with unknown error.', $order->get_id() ) );
+			return;
 		}
 
 		if ( isset( $response['error'] ) ) {
-			return $this->logger->error( sprintf( 'Failed to subscribe customer during checkout. The order with id "%d" failed with an error: %s', $order->get_id(), $response['error'] ) );
+			$this->logger->error( sprintf( 'Failed to subscribe customer during checkout. The order with id "%d" failed with an error: %s', $order->get_id(), $response['error'] ) );
+			return;
 		}
 
 		if ( isset( $response['body']['code'] ) && $response['body']['code'] !== 101 ) {
-			return $this->logger->error( sprintf( 'Failed to subscribe customer during checkout: %s', wp_json_encode( $response ) ) );
+			$this->logger->error( sprintf( 'Failed to subscribe customer during checkout: %s', wp_json_encode( $response ) ) );
+			return;
 		}
 	}
 
@@ -243,15 +248,18 @@ class Subscriber_Synchronization {
 		$request  = new Smaily_Client( $this->options );
 		$response = $request->update_subscribers( array_merge( $posted_data, Data_Handler::get_user_data( $user_id ) ) );
 		if ( empty( $response ) ) {
-			return $this->logger->error( sprintf( 'Updating subscriber with id "%d" failed with unknown error', $user_id ) );
+			$this->logger->error( sprintf( 'Updating subscriber with id "%d" failed with unknown error', $user_id ) );
+			return;
 		}
 
 		if ( isset( $response['error'] ) ) {
-			return $this->logger->error( sprintf( 'Updating subscriber with id "%d" failed with an error: %s', $user_id, $response['error'] ) );
+			$this->logger->error( sprintf( 'Updating subscriber with id "%d" failed with an error: %s', $user_id, $response['error'] ) );
+			return;
 		}
 
 		if ( isset( $response['body']['code'] ) && $response['body']['code'] !== 101 ) {
-			return $this->logger->error( sprintf( 'Updating subscriber failed: %s', wp_json_encode( $response ) ) );
+			$this->logger->error( sprintf( 'Updating subscriber failed: %s', wp_json_encode( $response ) ) );
+			return;
 		}
 	}
 }

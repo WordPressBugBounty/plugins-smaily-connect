@@ -2,6 +2,8 @@
 
 namespace Smaily_Connect\Includes;
 
+defined( 'ABSPATH' ) || exit;
+
 class Options {
 	/**
 	 * Default values for subscriber sync fields.
@@ -55,9 +57,56 @@ class Options {
 	);
 
 	/**
+	 * The abandoned-cart status option, normalized to the array shape every
+	 * consumer can offset into. Single read path (F3-54) — never call
+	 * get_option( ABANDONED_CART_STATUS_OPTION ) and offset it raw.
+	 *
+	 * @return array{enabled: bool, autoresponder_id: int}
+	 */
+	public static function abandoned_cart_status() {
+		return self::normalize_abandoned_cart_status(
+			get_option( self::ABANDONED_CART_STATUS_OPTION, self::ABANDONED_CART_DEFAULT_STATUS )
+		);
+	}
+
+	/**
+	 * Normalize a raw abandoned-cart status option value (F3-54).
+	 *
+	 * Two shapes exist in the wild for ABANDONED_CART_STATUS_OPTION: the
+	 * legacy array {enabled, autoresponder_id}, and a bare boolean the
+	 * 3.x Settings/wizard wrote until 3.4.3 — which WordPress stores as
+	 * the string '1'/'' and which made every array-offset consumer fatal
+	 * on PHP 8 ("Cannot access offset of type string on string", the
+	 * Prike 15-minute crash loop). This accepts both, and anything else,
+	 * and always returns the array shape.
+	 *
+	 * @param mixed $raw Raw option value.
+	 * @return array{enabled: bool, autoresponder_id: int}
+	 */
+	public static function normalize_abandoned_cart_status( $raw ) {
+		if ( is_array( $raw ) ) {
+			return array(
+				'enabled'          => ! empty( $raw['enabled'] ),
+				'autoresponder_id' => isset( $raw['autoresponder_id'] ) && is_scalar( $raw['autoresponder_id'] )
+					? (int) $raw['autoresponder_id']
+					: 0,
+			);
+		}
+
+		// Scalar shape (the pre-3.4.3 Settings wrote a bare boolean; WP
+		// stores it as '1'/''). The autoresponder id was never part of
+		// this shape — the new path resolves the workflow from the
+		// automation-mapping table instead.
+		return array(
+			'enabled'          => ! empty( $raw ),
+			'autoresponder_id' => 0,
+		);
+	}
+
+	/**
 	 * Minimum value the abandoned cart cutoff time can be set to in minutes.
 	 *
-	 * @var array
+	 * @var integer
 	 */
 	const ABANDONED_CART_MIN_CUTOFF = 10;
 
@@ -65,49 +114,49 @@ class Options {
 	 * Default cart cutoff time in minutes.
 	 * Best practice, offering largest potential for conversion.
 	 *
-	 * @var array
+	 * @var integer
 	 */
 	const ABANDONED_CART_DEFAULT_CUTOFF = 30;
 
 	/**
 	 * Default position for checkout subscription checkbox.
 	 *
-	 * @var array
+	 * @var string
 	 */
 	const CHECKOUT_SUBSCRIPTION_DEFAULT_POSITION = 'before';
 
 	/**
 	 * Default location for checkout subscription checkbox.
 	 *
-	 * @var array
+	 * @var string
 	 */
 	const CHECKOUT_SUBSCRIPTION_DEFAULT_LOCATION = 'order';
 
 	/**
 	 * Default number of RSS feed items.
 	 *
-	 * @var array
+	 * @var integer
 	 */
 	const RSS_DEFAULT_LIMIT = 50;
 
 	/**
 	 * Default RSS feed store tax rate.
 	 *
-	 * @var array
+	 * @var integer
 	 */
 	const RSS_DEFAULT_TAX_RATE = 0;
 
 	/**
 	 * Default RSS feed sort by.
 	 *
-	 * @var array
+	 * @var string
 	 */
 	const RSS_DEFAULT_SORT_BY = 'modified';
 
 	/**
 	 * Default RSS feed order by.
 	 *
-	 * @var array
+	 * @var string
 	 */
 	const RSS_DEFAULT_ORDER_BY = 'DESC';
 
@@ -263,7 +312,7 @@ class Options {
 	 * @return array   Smaily woocommerce settings in proper format
 	 */
 	private function get_woocommerce_settings_from_db() {
-		$cart_status = get_option( self::ABANDONED_CART_STATUS_OPTION, self::ABANDONED_CART_DEFAULT_STATUS );
+		$cart_status = self::abandoned_cart_status();
 
 		return array(
 			'subscriber_sync_enabled'   => get_option( self::SUBSCRIBER_SYNC_ENABLED_OPTION ),

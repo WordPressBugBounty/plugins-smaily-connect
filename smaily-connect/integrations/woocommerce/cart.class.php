@@ -2,9 +2,9 @@
 
 namespace Smaily_Connect\Integrations\WooCommerce;
 
-if ( ! defined( 'ABSPATH' ) ) {
-	exit;
-}
+defined( 'ABSPATH' ) || exit;
+
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.PreparedSQLPlaceholders.UnquotedComplexPlaceholder, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Custom plugin tables: interpolated values are $wpdb->prepare()d (dynamic IN() lists build placeholder strings); object-cache is N/A for a write-through queue / cleanup / DDL path.
 
 use Smaily_Connect\Includes\Helper;
 
@@ -120,7 +120,7 @@ class Cart {
 	/**
 	 * Check if customer has active cart in database.
 	 *
-	 * @param int $user_id Customer id.
+	 * @param int $customer_id Customer id.
 	 * @return boolean
 	 */
 	private function has_previous_cart( $customer_id ) {
