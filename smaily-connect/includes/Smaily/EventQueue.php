@@ -250,38 +250,87 @@ class EventQueue {
 	 * clears the retry-park + last_error, so a row that hit the RetryPolicy
 	 * ceiling (or a refusal classified permanent) starts fresh and is due
 	 * immediately. `$ids` null = every failed row; otherwise only the given ids.
+	 * `$exclude_event_types` holds event types a bulk revive must leave alone
+	 * — the transactional ones, whose retry the guard decides row by row
+	 * (PRO-1733); without it "Retry all failed" would revive exactly the rows
+	 * the single-row route turns down, so the caller resets the few it may.
 	 * Manual-only by design (a deterministic failure would loop under auto-retry).
 	 * Returns the row count.
 	 *
 	 * @param int[]|null $ids
+	 * @param string[]   $exclude_event_types
 	 */
-	public function reset_failed( ?array $ids = null ): int {
+	public function reset_failed( ?array $ids = null, array $exclude_event_types = array() ): int {
 		global $wpdb;
 		$table = $this->table_name();
 
 		$set = 'SET status = %s, attempts = 0, last_error = NULL, next_retry_at = NULL';
 
+		$exclude_sql = '';
+		if ( $exclude_event_types !== array() ) {
+			$exclude_sql = ' AND event_type NOT IN ( ' . implode( ', ', array_fill( 0, count( $exclude_event_types ), '%s' ) ) . ' )';
+		}
+
 		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 		if ( $ids === null ) {
 			$sql = $wpdb->prepare(
-				"UPDATE {$table} {$set} WHERE status = %s",
-				self::STATUS_PENDING,
-				self::STATUS_FAILED
+				"UPDATE {$table} {$set} WHERE status = %s{$exclude_sql}",
+				array_merge( array( self::STATUS_PENDING, self::STATUS_FAILED ), $exclude_event_types )
 			);
 		} else {
-			$ids = array_values( array_filter( array_map( 'intval', $ids ), static fn ( int $i ): bool => $i > 0 ) );
+			$ids = self::clean_ids( $ids );
 			if ( $ids === array() ) {
 				return 0;
 			}
 			$placeholders = implode( ', ', array_fill( 0, count( $ids ), '%d' ) );
 			$sql          = $wpdb->prepare(
-				"UPDATE {$table} {$set} WHERE status = %s AND id IN ( {$placeholders} )",
-				array_merge( array( self::STATUS_PENDING, self::STATUS_FAILED ), $ids )
+				"UPDATE {$table} {$set} WHERE status = %s AND id IN ( {$placeholders} ){$exclude_sql}",
+				array_merge( array( self::STATUS_PENDING, self::STATUS_FAILED ), $ids, $exclude_event_types )
 			);
 		}
 
 		return (int) $wpdb->query( $sql );
 		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	}
+
+	/**
+	 * Re-date the given rows' created_at to now (PRO-1733). The transactional
+	 * flusher's one-hour ceiling (PRO-1519) is measured from created_at, so a
+	 * revived transactional row would otherwise terminal-fail on the very next
+	 * tick — the retry has to give it a fresh hour. Deliberately narrow: only
+	 * /events/retry calls it, and only for the transactional rows it revived.
+	 * Returns the row count.
+	 *
+	 * @param int[] $ids
+	 */
+	public function restart_age( array $ids ): int {
+		global $wpdb;
+
+		$ids = self::clean_ids( $ids );
+		if ( $ids === array() ) {
+			return 0;
+		}
+
+		$table        = $this->table_name();
+		$placeholders = implode( ', ', array_fill( 0, count( $ids ), '%d' ) );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+		return (int) $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table} SET created_at = %s WHERE id IN ( {$placeholders} )",
+				array_merge( array( current_time( 'mysql', true ) ), $ids )
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	}
+
+	/**
+	 * @param int[] $ids
+	 *
+	 * @return int[]
+	 */
+	public static function clean_ids( array $ids ): array {
+		return array_values( array_filter( array_map( 'intval', $ids ), static fn ( int $i ): bool => $i > 0 ) );
 	}
 
 	/** Public kick so /events/retry can re-drive promptly after reset_failed(). */

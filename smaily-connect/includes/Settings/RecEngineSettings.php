@@ -34,13 +34,17 @@ use Smaily\Connect\Smaily\RecEngine\ExchangeResult;
  *   smly_rec_endpoints         json       autoload=false  endpoint url map
  *   smly_rec_config            json       autoload=false  cookie names + TTLs + rate limits
  *   smly_rec_issued_at         string     autoload=false  ISO 8601
+ *   smly_rec_refused_at        int        autoload=true   unix ts of the first refusal
  *
- * autoload=false on the api_key (and everything except the gate)
+ * autoload=false on the api_key (and everything except the gates)
  * keeps the encrypted secret out of the alloptions cache that lands
  * in every page request — small perf win, small surface-reduction
  * win. The merchant-facing UI only ever reads `connected` + tenant
  * display info on first paint; the api_key is re-fetched only when
- * a Client request actually needs it.
+ * a Client request actually needs it. `refused_at` is autoloaded for
+ * the opposite reason: it is a bare int, no secret, and it is read on
+ * every `/relay` request, every admin boot payload and every sending
+ * path, so it belongs in the cache the gate flag already lives in.
  *
  * Non-final: keeps the class testable through subclass-as-double in
  * unit tests, mirroring Settings\Credentials and Smaily\Client.
@@ -57,8 +61,58 @@ class RecEngineSettings {
 	public const OPTION_CONFIG         = 'smly_rec_config';
 	public const OPTION_ISSUED_AT      = 'smly_rec_issued_at';
 
+	/**
+	 * The engine refused this connection outright (contract §2 `403
+	 * tenant_inactive`): the key is valid, the account is not. Persisted
+	 * locally so the plugin stops sending instead of re-discovering the
+	 * refusal on every scheduled job (PRO-1893). A bare scalar rather than a
+	 * blob so a support read is a plain `wp option get`.
+	 */
+	public const OPTION_REFUSED_AT = 'smly_rec_refused_at';
+
 	public function is_connected(): bool {
 		return (bool) get_option( self::OPTION_CONNECTED, false );
+	}
+
+	/**
+	 * Has the engine refused this connection outright? Set by
+	 * Client::record_tenant_refusal() on a `403 tenant_inactive`, cleared
+	 * only by a fresh setup exchange (store()) or disconnect() — never by a
+	 * re-probe, because the engine's answer will not change on its own.
+	 */
+	public function is_refused(): bool {
+		return $this->refused_at() > 0;
+	}
+
+	/** Unix timestamp of the FIRST refusal, or 0 when not refused. */
+	public function refused_at(): int {
+		return (int) get_option( self::OPTION_REFUSED_AT, 0 );
+	}
+
+	/**
+	 * The gate every SENDING path consults: connected AND not refused. The
+	 * bare is_connected() stays the gate for everything that only enqueues,
+	 * reads or displays — queued rows are kept, not mass-failed, so they
+	 * resume the moment a new connection is set up.
+	 */
+	public function sending_allowed(): bool {
+		return $this->is_connected() && ! $this->is_refused();
+	}
+
+	/**
+	 * Record the refusal. Keeps the FIRST timestamp — the merchant wants to
+	 * know when sending stopped, not when we last confirmed it — so repeat
+	 * calls from concurrent jobs are a no-op.
+	 */
+	public function mark_refused(): void {
+		if ( $this->is_refused() ) {
+			return;
+		}
+		update_option( self::OPTION_REFUSED_AT, time(), true );
+	}
+
+	public function clear_refused(): void {
+		delete_option( self::OPTION_REFUSED_AT );
 	}
 
 	public function api_key(): string {
@@ -135,9 +189,12 @@ class RecEngineSettings {
 		update_option( self::OPTION_ENDPOINTS, (string) wp_json_encode( $result->endpoints ), false );
 		update_option( self::OPTION_CONFIG, (string) wp_json_encode( $result->config ), false );
 		update_option( self::OPTION_ISSUED_AT, $result->issued_at, false );
-		// connected is the only autoloaded flag — boot payload reads
-		// it on every admin page, so the alloptions cache makes the
-		// gate cheap.
+		// A successful exchange is the ONLY way back from a refused
+		// connection (PRO-1893): a new setup token means a live tenant,
+		// possibly a different one, so the stale refusal must not survive it.
+		$this->clear_refused();
+		// connected is autoloaded — boot payload reads it on every
+		// admin page, so the alloptions cache makes the gate cheap.
 		update_option( self::OPTION_CONNECTED, true, true );
 	}
 
@@ -161,6 +218,7 @@ class RecEngineSettings {
 			self::OPTION_ENDPOINTS,
 			self::OPTION_CONFIG,
 			self::OPTION_ISSUED_AT,
+			self::OPTION_REFUSED_AT,
 		);
 		foreach ( $keys as $key ) {
 			delete_option( $key );

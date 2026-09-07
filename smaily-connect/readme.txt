@@ -3,10 +3,10 @@ Contributors: sendsmaily, kaarel
 Tags: smaily, newsletter, email, mail, marketing
 Requires PHP: 8.0
 Requires at least: 6.6
-Tested up to: 7.0
+Tested up to: 7.1
 WC requires at least: 6.9
 WC tested up to: 10.7
-Stable tag: 3.11.2
+Stable tag: 3.11.3
 License: GPLv3 or later
 
 Email marketing, automations and personalized product recommendations for WordPress, WooCommerce, Contact Form 7 and Elementor — powered by Smaily.
@@ -33,14 +33,15 @@ Transform your **WordPress website, WooCommerce store, Contact Form 7 and Elemen
 
 **Easy, Fast & Code-Free Setup** – No tech skills needed! A **guided setup wizard** walks you through connecting your Smaily account and configuring every integration.
 
-= What's new in 2.0 =
+= What's new in version 3 =
 
-Version 2.0 is a major update built alongside the proven 1.x feature set:
+Version 3 is a rewrite of the plugin that keeps the familiar 1.x and 2.0 feature set — subscriber synchronization, abandoned cart reminders, the product RSS feed and signup forms — carries your existing settings over through the setup wizard, and adds:
 
 * **Setup wizard** – a guided, step-by-step first-run experience: connect your Smaily account, configure subscriber sync, WooCommerce automations, and form integrations.
 * **Modern admin** – a redesigned, mobile-friendly settings interface.
 * **Campaign Intelligence (WooCommerce)** – optionally connect your store to Smaily Campaign Intelligence. The plugin syncs your product catalog, customers and orders so it can generate personalized product recommendations for your email campaigns.
-* **Browse tracking (opt-in)** – an optional storefront beacon records browsing activity (product views, searches, cart events) to improve recommendations. It is **off by default**, requires the site admin to enable it, and only runs for shoppers who have given cookie consent (WP Consent API compatible, e.g. CookieYes).
+* **Browse tracking (opt-in)** – an optional storefront beacon records browsing activity (product views, searches, cart events) to improve recommendations. It is **off by default**, requires the site admin to enable it, and only runs for shoppers who have given marketing consent through the free WP Consent API plugin (CookieYes, Complianz and Real Cookie Banner all register their consent into it).
+* **Transactional emails (optional)** – send WooCommerce order confirmations and shipping notices through Smaily instead of WooCommerce's own mail, using a **separate Smaily account** kept apart from your marketing account. It is **off by default**; while it is on, the matching built-in WooCommerce email is suppressed so the customer never gets two, and if Smaily cannot be reached WooCommerce's own email is sent as a fallback.
 * **Privacy built in** – integrates with the WordPress Privacy tools (personal data export and erasure), and shoppers can opt out of recommendation profiling from their WooCommerce My Account page.
 * **Reliability you can see** – background work runs on durable queues (Action Scheduler); an Event Log shows every sync event, failed items can be retried from the UI, and health notices warn you proactively when a connected service is unreachable.
 * **Multilingual-aware** – language detection works with Polylang, WPML and TranslatePress for routing subscribers to the right lists and automations.
@@ -89,6 +90,16 @@ Contribute to the development via [GitHub](https://github.com/sendsmaily/smaily-
 == Changelog ==
 
 Only releases from 3.0.0 onward are listed here. The complete version history, including the 1.x and 2.x releases, is published at https://github.com/sendsmaily/smaily-wordpress-plugin/releases
+
+= 3.11.3 =
+* Fixed: the Smaily landing page block now keeps the landing page on the page after you save it. On sites where WordPress strips embedded frames from post content, the published page came out empty and the block reported "unexpected or invalid content" the next time it was opened.
+* Fixed: the Smaily landing page block now works for editors, not only administrators. It used to say "Please configure the plugin first" and show no URL field on a fully connected store.
+* Fixed: the newsletter sign-up block's automation list now loads for editors. The block used to sit on a loading spinner with no automation to choose and no error shown.
+* Fixed: the Event Log's Retry no longer disappears for a failed shipping confirmation on an order parked on a merchant-defined status whose plugin has since been deactivated. The order was reported as gone, even though it is still there.
+* Improved: the Event Log now offers Retry on a failed order or shipping confirmation only where the shopper never received one, and that retry now really re-sends it. Where WooCommerce already sent its own email instead of Smaily's, the Retry is gone and the row's details say why, so a retry can no longer deliver a second confirmation.
+* Improved: when your Smaily Campaign Intelligence account has been deactivated, the store now stops sending to it instead of retrying forever, and the admin notice says plainly that the account was deactivated and to contact Smaily. Queued events are kept and resume once the account is active again.
+* Improved: the plugin's WordPress.org description now describes what is new in version 3; it still described the change as "version 2.0".
+* Compatibility: tested against WordPress 7.1.
 
 = 3.11.2 =
 * Fixed: on a store where Smaily Campaign Intelligence uses its own attribution cookie names, orders now carry their recommendation attribution again — the checkout was looking those cookies up under the default names only, so no order recorded which recommendation it came from.
@@ -226,6 +237,9 @@ First general-availability release, graduating the 2.1.0-beta line. Existing set
 * Hardening: WordPress.org Plugin Check pass (sanitization, escaping, prefixing, ABSPATH guards); editor blocks updated to Block API v3 for the WordPress 7.0 iframe editor; diagnostics gated behind WP_DEBUG.
 
 == Upgrade Notice ==
+
+= 3.11.3 =
+Fixes only. The landing page and newsletter sign-up blocks now work for editors and keep their content after saving; the Event Log retries order and shipping confirmations correctly; a deactivated Campaign Intelligence account now stops sending and says so. Safe update.
 
 = 3.11.2 =
 This is the major version 3 rewrite. After updating, open Smaily Connect in the admin menu and confirm your settings in the setup wizard. Live contact syncing keeps working meanwhile; the daily catch-up sync resumes once the wizard is confirmed. See the migration guide for the full upgrade path.

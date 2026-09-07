@@ -144,17 +144,28 @@ abstract class AbstractBackfillJob implements BackfillJobInterface {
 		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
 
 		if ( ! is_array( $state ) ) {
-			return array(
-				'processed' => 0,
-				'sent'      => 0,
-				'failed'    => 0,
-				'remaining' => 0,
-				'completed' => true,
-			);
+			return $this->batch_result( 0, 0, 0, 0, true );
 		}
 
 		$after = isset( $state['cursor_value'] ) ? (int) $state['cursor_value'] : 0;
-		$ids   = $this->fetch_ids_after( $after, $batch_size );
+
+		// The engine refused this account outright (contract §2
+		// `403 tenant_inactive`) — every row this batch enqueued would sit
+		// unsendable, so stop before enumerating anything. The cursor and the
+		// `running` status are left exactly as they are: the import is paused,
+		// not lost, and the next tick resumes it once a new connection is set
+		// up (PRO-1893).
+		if ( ! $this->flusher->sending_allowed() ) {
+			return $this->batch_result(
+				0,
+				0,
+				0,
+				max( 0, (int) $state['total_count'] - (int) $state['processed_count'] ),
+				false
+			);
+		}
+
+		$ids = $this->fetch_ids_after( $after, $batch_size );
 
 		foreach ( $ids as $entity_id ) {
 			$this->enqueue_record( (int) $entity_id );
@@ -181,11 +192,26 @@ abstract class AbstractBackfillJob implements BackfillJobInterface {
 			array( '%d' )
 		);
 
+		return $this->batch_result(
+			count( $ids ),
+			$flush['sent'],
+			$flush['failed'],
+			max( 0, (int) $state['total_count'] - $processed ),
+			$completed
+		);
+	}
+
+	/**
+	 * The one shape process_batch() answers in, whatever happened.
+	 *
+	 * @return array{processed: int, sent: int, failed: int, remaining: int, completed: bool}
+	 */
+	private function batch_result( int $processed, int $sent, int $failed, int $remaining, bool $completed ): array {
 		return array(
-			'processed' => count( $ids ),
-			'sent'      => $flush['sent'],
-			'failed'    => $flush['failed'],
-			'remaining' => max( 0, (int) $state['total_count'] - $processed ),
+			'processed' => $processed,
+			'sent'      => $sent,
+			'failed'    => $failed,
+			'remaining' => $remaining,
 			'completed' => $completed,
 		);
 	}

@@ -99,6 +99,11 @@ abstract class AbstractD6Flusher {
 	 */
 	abstract protected function row_to_object( array $row ): ?array;
 
+	/** May this flusher talk to the engine at all? (PRO-1893; the backfills ask too.) */
+	public function sending_allowed(): bool {
+		return $this->settings->sending_allowed();
+	}
+
 	/**
 	 * Process up to $batch_size due rows (defaults to the endpoint's cap).
 	 *
@@ -113,7 +118,7 @@ abstract class AbstractD6Flusher {
 			'skipped'   => 0,
 		);
 
-		if ( ! $this->settings->is_connected() ) {
+		if ( ! $this->sending_allowed() ) {
 			return $stats;
 		}
 

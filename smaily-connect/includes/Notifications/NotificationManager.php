@@ -64,6 +64,15 @@ final class NotificationManager {
 	/** Advisory key: browse tracking on + connected, but no WP Consent API present. */
 	public const CONSENT_ADVISORY_KEY = 'consent_api_missing';
 
+	/**
+	 * Notice key: the engine refused this account outright (contract §2
+	 * `403 tenant_inactive`). Rendered live off the persisted refusal rather
+	 * than from the health-check's notice set — the refusal is recorded the
+	 * instant a call meets it, and making the merchant wait up to an hour for
+	 * the next tick to be told why sync stopped would be the wrong answer.
+	 */
+	public const TENANT_INACTIVE_KEY = 'engine_tenant_inactive';
+
 	/** Advisory key: the saved contact-field selection is in a shape we can't read. */
 	public const SYNC_FIELDS_ADVISORY_KEY = 'sync_fields_unreadable';
 
@@ -203,9 +212,15 @@ final class NotificationManager {
 	 * successful ping (or when disconnected — no engine to be "down"), set to now
 	 * on the first failed ping, kept across subsequent failures. Returns the
 	 * current down_since (or null when up / disconnected).
+	 *
+	 * A REFUSED connection (contract §2 `403 tenant_inactive`) is not probed at
+	 * all and clears the stamp: the engine is answering perfectly well, it is
+	 * the account that is deactivated. Re-probing would burn a request an hour
+	 * to be told the same thing, and "unreachable" is the wrong story to tell
+	 * the merchant — the deactivation notice below is the true one (PRO-1893).
 	 */
 	private function probe_engine( int $now ): ?int {
-		if ( ! $this->settings->is_connected() ) {
+		if ( ! $this->settings->sending_allowed() ) {
 			delete_option( self::OPTION_DOWN_SINCE );
 			return null;
 		}
@@ -320,10 +335,14 @@ final class NotificationManager {
 		$notices   = $this->active_notices();
 		$dismissed = (array) get_option( self::OPTION_DISMISSED, array() );
 		$now       = time();
+		$refused   = $this->settings->is_refused();
+
+		if ( $refused ) {
+			$this->render_tenant_inactive_notice( $dismissed, $now );
+		}
 
 		foreach ( $notices as $key => $notice ) {
-			$dismissed_at = isset( $dismissed[ $key ] ) ? (int) $dismissed[ $key ] : 0;
-			if ( $dismissed_at > 0 && ( $now - $dismissed_at ) < self::DISMISS_COOLDOWN ) {
+			if ( $this->is_dismissed( $key, $dismissed, $now ) ) {
 				continue;
 			}
 
@@ -338,7 +357,7 @@ final class NotificationManager {
 		// Config advisory (live, not cron-driven): browse tracking on + connected but
 		// no WP Consent API ⇒ the beacon is fail-closed and sends nothing. Not an
 		// error — a setup advisory (notice-warning), same 24h dismiss cooldown.
-		$this->render_consent_advisory( $dismissed, $now );
+		$this->render_consent_advisory( $dismissed, $now, ! $refused );
 
 		// Same kind of advisory: the saved contact-field selection is in a shape
 		// this version can't read, so which fields the merchant chose is unknown.
@@ -346,21 +365,49 @@ final class NotificationManager {
 	}
 
 	/**
+	 * The engine has refused this account outright (contract §2). Says so
+	 * plainly and names the only action that helps — contact Smaily — instead
+	 * of the generic "unreachable, it will resume" story, which is false here:
+	 * no retry, key, setup token or regenerate flow revives a deactivated
+	 * tenant. Same dismissal semantics as the health-check notices.
+	 *
 	 * @param array<string, int> $dismissed
 	 */
-	private function render_consent_advisory( array $dismissed, int $now ): void {
+	private function render_tenant_inactive_notice( array $dismissed, int $now ): void {
+		$key = self::TENANT_INACTIVE_KEY;
+		if ( $this->is_dismissed( $key, $dismissed, $now ) ) {
+			return;
+		}
+
+		printf(
+			'<div class="notice notice-error"><p>%1$s %2$s</p></div>',
+			esc_html__(
+				'Smaily Connect: your Smaily Campaign Intelligence account has been deactivated, so no product, customer or order data is being sent to it. Contact Smaily to reactivate it. Nothing is lost in the meantime — queued data waits, and syncing resumes once you connect the reactivated account.',
+				'smaily-connect'
+			),
+			wp_kses_post( $this->dismiss_link( $key ) )
+		);
+	}
+
+	/**
+	 * @param array<string, int> $dismissed
+	 * @param bool               $sending_allowed The gate render() already computed —
+	 *        a refused account collects nothing for a reason installing a consent
+	 *        plugin cannot fix, and the deactivation notice is the one to act on
+	 *        (PRO-1893).
+	 */
+	private function render_consent_advisory( array $dismissed, int $now, bool $sending_allowed ): void {
 		$active = $this->needs_consent_api_notice(
 			(bool) get_option( BeaconEndpoint::OPTION_TRACK_BROWSING, false ),
-			$this->settings->is_connected(),
+			$sending_allowed,
 			function_exists( 'wp_has_consent' )
 		);
 		if ( ! $active ) {
 			return;
 		}
 
-		$key          = self::CONSENT_ADVISORY_KEY;
-		$dismissed_at = isset( $dismissed[ $key ] ) ? (int) $dismissed[ $key ] : 0;
-		if ( $dismissed_at > 0 && ( $now - $dismissed_at ) < self::DISMISS_COOLDOWN ) {
+		$key = self::CONSENT_ADVISORY_KEY;
+		if ( $this->is_dismissed( $key, $dismissed, $now ) ) {
 			return;
 		}
 
@@ -389,9 +436,8 @@ final class NotificationManager {
 			return;
 		}
 
-		$key          = self::SYNC_FIELDS_ADVISORY_KEY;
-		$dismissed_at = isset( $dismissed[ $key ] ) ? (int) $dismissed[ $key ] : 0;
-		if ( $dismissed_at > 0 && ( $now - $dismissed_at ) < self::DISMISS_COOLDOWN ) {
+		$key = self::SYNC_FIELDS_ADVISORY_KEY;
+		if ( $this->is_dismissed( $key, $dismissed, $now ) ) {
 			return;
 		}
 
@@ -423,11 +469,36 @@ final class NotificationManager {
 	}
 
 	/**
+	 * Is this notice inside its 24h dismiss cooldown?
+	 *
+	 * @param array<string, int> $dismissed
+	 */
+	private function is_dismissed( string $key, array $dismissed, int $now ): bool {
+		$dismissed_at = isset( $dismissed[ $key ] ) ? (int) $dismissed[ $key ] : 0;
+		return $dismissed_at > 0 && ( $now - $dismissed_at ) < self::DISMISS_COOLDOWN;
+	}
+
+	/**
+	 * The health check's persisted notice set, corrected for what is true now.
+	 *
+	 * A deactivated account is not an outage: the probe stops running while
+	 * refused, so an `engine_down` verdict can only survive from before the
+	 * refusal, and telling the merchant to wait for a recovery that will never
+	 * come would bury the one thing they can act on. Dropped here rather than
+	 * at the point of rendering so every reader of the set sees the same
+	 * corrected answer (PRO-1893).
+	 *
 	 * @return array<string, array<string, mixed>>
 	 */
 	public function active_notices(): array {
 		$notices = get_option( self::OPTION_NOTICES, array() );
-		return is_array( $notices ) ? $notices : array();
+		$notices = is_array( $notices ) ? $notices : array();
+
+		if ( $this->settings->is_refused() ) {
+			unset( $notices['engine_down'] );
+		}
+
+		return $notices;
 	}
 
 	/**

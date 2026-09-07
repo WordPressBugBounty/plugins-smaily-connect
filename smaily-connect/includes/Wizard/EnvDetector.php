@@ -510,6 +510,9 @@ class EnvDetector {
 		$settings = new RecEngineSettings();
 		return array(
 			'connected'     => $settings->is_connected(),
+			// The engine refused this account outright — see the React side's
+			// WizardState.recEngineRefused for the full note (PRO-1893).
+			'refused'       => $settings->is_refused(),
 			'tenantName'    => $settings->tenant_name(),
 			'tenantId'      => $settings->tenant_id(),
 			'engineVersion' => $settings->engine_version(),

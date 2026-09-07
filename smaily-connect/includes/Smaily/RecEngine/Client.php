@@ -9,6 +9,8 @@ declare(strict_types=1);
 
 namespace Smaily\Connect\Smaily\RecEngine;
 
+use Smaily\Connect\Settings\RecEngineSettings;
+
 defined( 'ABSPATH' ) || exit;
 
 // phpcs:disable WordPress.Security.EscapeOutput.ExceptionNotEscaped -- exception messages are captured to the Event Log / returned to admin-only read models, never echoed to a browser; output-escaping does not apply.
@@ -50,6 +52,15 @@ class Client {
 	 * the same commit that handles a breaking-change migration.
 	 */
 	public const SUPPORTED_MAJOR = 1;
+
+	/**
+	 * The engine's "this account is deactivated" error code (contract §2).
+	 * Answered with HTTP 403 by EVERY API-key-authenticated endpoint
+	 * (§2–§14) for a suspended OR a purged/offboarded tenant. The `error`
+	 * CODE is the only discriminator — the body's `tenant_status` is a fixed
+	 * string the contract explicitly forbids branching on.
+	 */
+	public const ERROR_TENANT_INACTIVE = 'tenant_inactive';
 
 	// ---------------------------------------------------------------
 	// Path constants — every URL the plugin sends to the engine flows
@@ -109,6 +120,8 @@ class Client {
 
 	private int $max_attempts;
 
+	private RecEngineSettings $settings;
+
 	/**
 	 * @param string                $api_key      Bearer key, e.g. "sk_8f3k2a...".
 	 * @param string                $base_url     Engine origin, e.g. "https://intelligence.smaily.com".
@@ -119,12 +132,15 @@ class Client {
 	 *                                            small value (1-2): a long sleep-backoff would block
 	 *                                            the Action Scheduler worker, and the durable queue
 	 *                                            already retries at the row level via next_retry_at.
+	 * @param RecEngineSettings     $settings     Where a refusal is persisted (PRO-1893). Optional so
+	 *                                            no call site has to change.
 	 */
-	public function __construct( string $api_key, string $base_url, array $endpoints = array(), int $max_attempts = self::DEFAULT_MAX_ATTEMPTS ) {
+	public function __construct( string $api_key, string $base_url, array $endpoints = array(), int $max_attempts = self::DEFAULT_MAX_ATTEMPTS, ?RecEngineSettings $settings = null ) {
 		$this->api_key      = $api_key;
 		$this->base_url     = rtrim( $base_url, '/' );
 		$this->endpoints    = $endpoints;
 		$this->max_attempts = max( 1, $max_attempts );
+		$this->settings     = $settings ?? new RecEngineSettings();
 	}
 
 	/**
@@ -563,6 +579,11 @@ class Client {
 
 			$error_code = isset( $decoded['error'] ) ? (string) $decoded['error'] : 'http_' . $status;
 			$message    = isset( $decoded['message'] ) ? (string) $decoded['message'] : sprintf( 'Engine returned HTTP %d', $status );
+
+			if ( $status === 403 && $error_code === self::ERROR_TENANT_INACTIVE ) {
+				$this->record_tenant_refusal( $error_code );
+			}
+
 			throw new ApiException( $status, $error_code, $message, $decoded );
 		}
 	}
@@ -593,6 +614,24 @@ class Client {
 				)
 			);
 		}
+	}
+
+	/**
+	 * Persist the engine's outright refusal of this connection (contract §2).
+	 * Every engine call funnels through request_url(), so this ONE chokepoint
+	 * covers the flushers, the backfills' inline drain, the `/relay` proxy
+	 * forward, the automations config calls, the health probe and the GDPR
+	 * customer calls — no caller has to recognise the code itself.
+	 *
+	 * Protected so tests can observe it through the subclass-as-double idiom
+	 * the rest of this class already uses — which is also why the code that
+	 * triggered the refusal is still handed over, though only one code ever
+	 * reaches here.
+	 *
+	 * @param string $error_code The engine error code (contract §2: `tenant_inactive`).
+	 */
+	protected function record_tenant_refusal( string $error_code ): void {
+		$this->settings->mark_refused();
 	}
 
 	/**
