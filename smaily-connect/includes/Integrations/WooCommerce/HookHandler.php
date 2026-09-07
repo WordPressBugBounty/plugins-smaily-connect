@@ -14,6 +14,7 @@ defined( 'ABSPATH' ) || exit;
 use Smaily\Connect\Settings\RecEngineSettings;
 use Smaily\Connect\Settings\SetupState;
 use Smaily\Connect\Smaily\AutomationMarker;
+use Smaily\Connect\Smaily\CartFlusher;
 use Smaily\Connect\Smaily\ContactAudience;
 use Smaily\Connect\Smaily\ContactReconciler;
 use Smaily\Connect\Smaily\ContactSyncMode;
@@ -295,6 +296,7 @@ class HookHandler {
 		$this->sync_order_contact( $order, $opted_in );
 
 		$this->maybe_enqueue_first_order( $order );
+		$this->maybe_mark_abandoned_cart_purchase( $order );
 	}
 
 	/**
@@ -330,6 +332,59 @@ class HookHandler {
 	public function on_block_checkout_order_processed( \WC_Order $order ): void {
 		$this->save_attribution_cookies_to_order( $order );
 		$this->maybe_enqueue_first_order( $order );
+		$this->maybe_mark_abandoned_cart_purchase( $order );
+	}
+
+	/**
+	 * A shopper the plugin reminded about their cart has bought (PRO-1723):
+	 * a reminder still sitting in the queue is withdrawn, and the purchase is
+	 * written to their Smaily contact as `abandoned_cart_purchased_at`, which
+	 * is what lets the merchant's workflow exit the follow-up letters. The
+	 * marker is written ONLY for an address the queue still proves a reminder
+	 * was delivered to — see docs/DECISIONS.md, PRO-1723.
+	 */
+	private function maybe_mark_abandoned_cart_purchase( \WC_Order $order ): void {
+		if ( $this->gate_closed() ) {
+			return;
+		}
+
+		// Every address the buyer could have been reminded at is withdrawn
+		// from; the marker goes to the first one a reminder reached.
+		$reminded = '';
+		foreach ( $this->buyer_emails( $order ) as $email ) {
+			if ( $this->queue->withdraw_pending_for( CartFlusher::EVENT_TYPE, $email ) && $reminded === '' ) {
+				$reminded = $email;
+			}
+		}
+
+		if ( $reminded === '' ) {
+			return;
+		}
+
+		$this->maybe_enqueue(
+			self::EVENT_CONTACT_SYNC,
+			'order:' . $order->get_id() . ':cart-purchase',
+			array(
+				'email'  => $reminded,
+				'fields' => AutomationMarker::purchase_stamp(),
+			)
+		);
+	}
+
+	/**
+	 * The addresses this order's buyer could have been reminded at, in the
+	 * order they are tried: the address they checked out with, then — for a
+	 * registered customer whose account address differs — their account
+	 * address, which is the one the cart tracker records for a logged-in
+	 * shopper. Same belt-and-braces as CartHookHandler's order clearing.
+	 *
+	 * @return array<int, string>
+	 */
+	private function buyer_emails( \WC_Order $order ): array {
+		$user          = get_userdata( (int) $order->get_customer_id() );
+		$account_email = $user instanceof \WP_User ? (string) $user->user_email : '';
+
+		return array_values( array_unique( array_filter( array( (string) $order->get_billing_email(), $account_email ) ) ) );
 	}
 
 	/**

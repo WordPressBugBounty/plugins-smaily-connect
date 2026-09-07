@@ -94,6 +94,7 @@ return array(
     'Smaily\\Connect\\Smaily\\TransactionalFlusher' => $baseDir . '/includes/Smaily/TransactionalFlusher.php',
     'Smaily\\Connect\\Smaily\\TransactionalGate' => $baseDir . '/includes/Smaily/TransactionalGate.php',
     'Smaily\\Connect\\Smaily\\TransactionalPayloadBuilder' => $baseDir . '/includes/Smaily/TransactionalPayloadBuilder.php',
+    'Smaily\\Connect\\Smaily\\TransactionalResend' => $baseDir . '/includes/Smaily/TransactionalResend.php',
     'Smaily\\Connect\\Smaily\\TransactionalRetryGuard' => $baseDir . '/includes/Smaily/TransactionalRetryGuard.php',
     'Smaily\\Connect\\Smaily\\TransactionalSuppression' => $baseDir . '/includes/Smaily/TransactionalSuppression.php',
     'Smaily\\Connect\\Smaily\\WorkflowMatch' => $baseDir . '/includes/Smaily/WorkflowMatch.php',

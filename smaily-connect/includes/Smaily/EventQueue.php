@@ -24,12 +24,14 @@ defined( 'ABSPATH' ) || exit;
  * RetryPolicy). A retry parks the row with next_retry_at in the future;
  * pending() skips rows that aren't due yet (PRO-1685).
  *
- * Dispatch: enqueue() persists the row immediately and asks Action
- * Scheduler to fire smly_plus_flush_event_queue ASAP, deduplicated via
- * as_next_scheduled_action so multiple enqueues within one PHP request
- * collapse into a single flush job. The flush hook itself (which reads
- * pending rows, calls the appropriate API method, and updates status)
- * is registered by sub-PR 5 once the WC hook layer lands.
+ * Dispatch: enqueue() persists the row immediately and makes sure a
+ * smly_plus_flush_event_queue pass is queued, deduplicated via
+ * as_next_scheduled_action against whatever is already scheduled on that
+ * hook — and the flusher's recurring action always is, so the row goes out
+ * on the NEXT SCHEDULED PASS (PRO-2323 wording), not on an enqueue-time
+ * run-now. The flush hook itself (which reads pending rows, calls the
+ * appropriate API method, and updates status) is registered by sub-PR 5
+ * once the WC hook layer lands.
  *
  * This class deliberately does NOT call the Smaily API itself. That keeps
  * enqueue() cheap (it's invoked from hot paths like user_register and
@@ -52,12 +54,28 @@ class EventQueue {
 	public const AS_GROUP   = 'smaily-connect';
 
 	/**
+	 * The `last_response` outcome a withdrawn row carries. The Event Log list
+	 * reads it back to label the row cancelled (PRO-2372) — it is what tells a
+	 * withdrawal apart from the flushers' other terminal skips, which record
+	 * `skipped` and really are ordinary "nothing to send" rows.
+	 */
+	public const OUTCOME_CANCELLED = 'cancelled';
+
+	/** The outcome a flusher records for an ordinary "nothing to send" terminal skip. */
+	public const OUTCOME_SKIPPED = 'skipped';
+
+	/** Why a row was withdrawn — the note the Event Log shows on a cancelled row. */
+	private const NOTE_CANCELLED = 'the shopper completed a purchase before the reminder was sent';
+
+	/**
 	 * Persist an event and ensure a flush is scheduled.
 	 *
 	 * @param string               $event_type e.g. "contact.sync", "automation.welcome".
 	 * @param string               $entity_id  Free-form identifier (user_id, order_id, email).
 	 * @param array<string, mixed> $payload    JSON-serialisable data the flush job will
-	 *                                         hand off to the right API method.
+	 *                                         hand off to the right API method. Its
+	 *                                         `email`, when it has one, is stamped
+	 *                                         onto the row as contact_key().
 	 *
 	 * @return int|null Inserted row id on success, or null if the insert failed.
 	 *                  Insert failures are intentionally silent — the caller is
@@ -72,17 +90,20 @@ class EventQueue {
 			return null;
 		}
 
+		$email = isset( $payload['email'] ) && is_string( $payload['email'] ) ? $payload['email'] : '';
+
 		$inserted = $wpdb->insert(
 			$this->table_name(),
 			array(
-				'event_type' => $event_type,
-				'entity_id'  => $entity_id,
-				'payload'    => $json,
-				'created_at' => current_time( 'mysql', true ),
-				'attempts'   => 0,
-				'status'     => self::STATUS_PENDING,
+				'event_type'  => $event_type,
+				'entity_id'   => $entity_id,
+				'payload'     => $json,
+				'contact_key' => $email === '' ? null : self::contact_key( $email ),
+				'created_at'  => current_time( 'mysql', true ),
+				'attempts'    => 0,
+				'status'      => self::STATUS_PENDING,
 			),
-			array( '%s', '%s', '%s', '%s', '%d', '%s' )
+			array( '%s', '%s', '%s', '%s', '%s', '%d', '%s' )
 		);
 
 		if ( $inserted !== 1 ) {
@@ -158,6 +179,107 @@ class EventQueue {
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
 
 		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * Withdraw every still-pending row of this event type addressed to this
+	 * contact, and report whether one of their rows was ever actually
+	 * DELIVERED (PRO-1723). The checkout path asks both questions about the
+	 * same shopper, so they are one read of that contact's rows: a reminder
+	 * must not go out behind a purchase already completed, and the purchase
+	 * is marked on the contact only when a reminder really did go out.
+	 *
+	 * "Delivered" is stricter than `sent`: the terminal skips (no workflow
+	 * mapped, missing email) also end as `sent`, and they POSTed nothing —
+	 * they are told apart by `sent_payload`, which the flushers write only
+	 * for a row that really reached Smaily (F3-44). A row withdrawn here
+	 * takes that same skip shape, so it never reads as delivered.
+	 *
+	 * Rows are found by contact_key(), the indexed hash of the address
+	 * (migration 011) — the queue does not search its own payload text and
+	 * knows nothing about the JSON's shape. Rows enqueued before migration
+	 * 011 carry no key and are invisible here.
+	 *
+	 * Bounded by the QueueJanitor's retention, deliberately: as long as the
+	 * row that proves the send is still here, the shopper counts as reminded.
+	 *
+	 * @return bool True when a row of this type was delivered to this contact.
+	 */
+	public function withdraw_pending_for( string $event_type, string $email ): bool {
+		global $wpdb;
+
+		$table = $this->table_name();
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, status, sent_payload FROM {$table} WHERE event_type = %s AND contact_key = %s",
+				$event_type,
+				self::contact_key( $email )
+			),
+			ARRAY_A
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
+
+		$delivered = false;
+
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$status = (string) ( $row['status'] ?? '' );
+
+			if ( $status === self::STATUS_SENT ) {
+				$delivered = $delivered || (string) ( $row['sent_payload'] ?? '' ) !== '';
+				continue;
+			}
+
+			if ( $status === self::STATUS_PENDING ) {
+				$this->cancel( (int) $row['id'] );
+			}
+		}
+
+		return $delivered;
+	}
+
+	/**
+	 * The row key for a contact: a sha256 of the normalised address. A HASH,
+	 * never the address itself — the queue keeps no second copy of a contact's
+	 * email beyond the payload it already stores, and this is what the
+	 * checkout path looks rows up by. Trimmed + lowercased so an address typed
+	 * differently at checkout still finds the row it was queued under, which
+	 * is what the old payload search got from the column's collation.
+	 */
+	public static function contact_key( string $email ): string {
+		return hash( 'sha256', strtolower( trim( $email ) ) );
+	}
+
+	/**
+	 * Terminally withdraw one row, through the established terminal-skip pair
+	 * (mark_sent + a skip exchange, exactly as a flusher records one): the
+	 * Event Log shows the `cancelled` outcome, nothing is retried, and with
+	 * no sent_payload the row never counts as delivered.
+	 */
+	private function cancel( int $id ): void {
+		$this->mark_sent( $id );
+		$this->store_exchange(
+			$id,
+			null,
+			(string) wp_json_encode(
+				array(
+					'outcome' => self::OUTCOME_CANCELLED,
+					'note'    => self::NOTE_CANCELLED,
+				)
+			)
+		);
+	}
+
+	/**
+	 * Whether a stored `last_response` records a withdrawal rather than a send
+	 * (PRO-2372). The one place that knows the shape cancel() writes, so the
+	 * Event Log's read model doesn't have to.
+	 */
+	public static function is_cancelled_response( string $last_response ): bool {
+		$decoded = json_decode( $last_response, true );
+
+		return is_array( $decoded ) && ( $decoded['outcome'] ?? '' ) === self::OUTCOME_CANCELLED;
 	}
 
 	public function mark_sent( int $id ): void {
@@ -333,14 +455,22 @@ class EventQueue {
 		return array_values( array_filter( array_map( 'intval', $ids ), static fn ( int $i ): bool => $i > 0 ) );
 	}
 
-	/** Public kick so /events/retry can re-drive promptly after reset_failed(). */
+	/**
+	 * Public entry point so /events/retry can make sure a flush pass is queued
+	 * after reset_failed(). Deduplicated like every other caller, so the rows
+	 * go out on the flusher's next scheduled pass (PRO-2323).
+	 */
 	public function schedule_flush(): void {
 		$this->maybe_schedule_flush();
 	}
 
 	/**
-	 * Ensure an async flush is queued. Deduplicated so multiple enqueues
-	 * in one request collapse to a single AS row.
+	 * Ensure a flush pass is queued. Deduplicated so multiple enqueues in one
+	 * request collapse to a single AS row — and because the flusher's
+	 * recurring action is always scheduled, in practice this is a no-op and
+	 * the rows go out at the next scheduled pass (PRO-2323). It is the safety
+	 * net for a store whose recurring action has gone missing, not a run-now
+	 * kick.
 	 */
 	private function maybe_schedule_flush(): void {
 		if ( ! function_exists( 'as_enqueue_async_action' ) ) {

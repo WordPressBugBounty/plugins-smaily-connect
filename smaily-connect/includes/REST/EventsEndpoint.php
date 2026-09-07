@@ -24,6 +24,7 @@ use Smaily\Connect\Smaily\RecEngine\CustomerFlusher;
 use Smaily\Connect\Smaily\RecEngine\IngestQueue;
 use Smaily\Connect\Smaily\RecEngine\OrderFlusher;
 use Smaily\Connect\Smaily\TransactionalFlusher;
+use Smaily\Connect\Smaily\TransactionalResend;
 use Smaily\Connect\Smaily\TransactionalRetryGuard;
 use WP_Error;
 use WP_REST_Request;
@@ -39,7 +40,8 @@ use WP_REST_Response;
  *                        → { ...row, payload }   (the full payload for drill-down)
  *
  * This is the visibility half of the 3.10 pilot-hardening work (Layer 1), plus
- * the 3.10.1 recovery write route (`POST /events/retry`) over the same rows.
+ * the 3.10.1 recovery write route (`POST /events/retry`) and the deliberate
+ * second confirmation (`POST /events/resend`, PRO-2324) over the same rows.
  * The data is a
  * UNION over `smly_rec_event_queue` (source=rec_engine) and
  * `smly_plus_event_queue` (source=smaily); both already carry every column the
@@ -59,6 +61,18 @@ class EventsEndpoint {
 	/** Sources the UNION exposes; the value doubles as the wire `source`. */
 	private const SOURCE_REC    = 'rec_engine';
 	private const SOURCE_SMAILY = 'smaily';
+
+	/** @var callable(): TransactionalResend */
+	private $resend_factory;
+
+	/**
+	 * @param callable(): TransactionalResend $resend_factory Built on demand —
+	 *                                                        only `resend()`
+	 *                                                        needs it.
+	 */
+	public function __construct( callable $resend_factory ) {
+		$this->resend_factory = $resend_factory;
+	}
 
 	public function register(): void {
 		register_rest_route(
@@ -89,6 +103,19 @@ class EventsEndpoint {
 			array(
 				'methods'             => 'POST',
 				'callback'            => array( $this, 'retry' ),
+				'permission_callback' => array( $this, 'permission_check' ),
+			)
+		);
+
+		// A deliberate second confirmation (PRO-2324). Same capability +
+		// nonce gate as Retry; it is a different question about a different
+		// row, so it is a different route.
+		register_rest_route(
+			Constants::REST_NAMESPACE,
+			self::ROUTE_PREFIX . '/resend',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'resend' ),
 				'permission_callback' => array( $this, 'permission_check' ),
 			)
 		);
@@ -162,8 +189,6 @@ class EventsEndpoint {
 	 * Full payload for a single row (drill-down). Source + id select the table.
 	 */
 	public function detail( WP_REST_Request $request ): WP_REST_Response {
-		global $wpdb;
-
 		$source = $this->sanitize_source( (string) $request->get_param( 'source' ) );
 		$id     = (int) $request->get_param( 'id' );
 
@@ -172,15 +197,9 @@ class EventsEndpoint {
 		}
 
 		$table = $source === self::SOURCE_REC ? $this->rec_table() : $this->smaily_table();
+		$row   = $this->fetch_row( $table, $id );
 
-		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
-		$row = $wpdb->get_row(
-			$wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", $id ),
-			ARRAY_A
-		);
-		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-
-		if ( ! is_array( $row ) ) {
+		if ( $row === null ) {
 			return new WP_REST_Response( array( 'error' => 'not_found' ), 404 );
 		}
 
@@ -188,7 +207,10 @@ class EventsEndpoint {
 
 		return new WP_REST_Response(
 			array(
-				'event'         => $this->shape_rows( array( $row ) )[0],
+				// A drill-down never renders the "Send again" button, so it
+				// skips that answer rather than paying for the order lookup
+				// behind it (the retry refusal it DOES render still costs one).
+				'event'         => $this->shape_rows( array( $row ), false )[0],
 				'payload'       => isset( $row['payload'] ) ? (string) $row['payload'] : '',
 				// The send-time exchange (F3-44): exactly what was POSTed + the
 				// engine reply. Empty for rows enqueued before this shipped, or
@@ -207,8 +229,11 @@ class EventsEndpoint {
 	 *   - id + source        → revive that single failed row in that queue.
 	 *   - source (no id)      → revive ALL failed rows in that queue.
 	 *   - neither             → revive ALL failed rows in BOTH queues.
-	 * reset_failed() flips FAILED→PENDING; this then kicks the recurring flushes
-	 * so the rows re-send promptly instead of waiting for the next 60s tick.
+	 * reset_failed() flips FAILED→PENDING; this then makes sure a flush pass is
+	 * scheduled for every hook that drains them. The re-send is NOT immediate
+	 * (PRO-2323): the one-offs dedupe against the flushers' recurring actions,
+	 * which are always scheduled, so a revived row goes out on its flusher's
+	 * next scheduled pass — within about a minute.
 	 *
 	 * Which failed transactional rows may be revived at all is not this
 	 * route's rule to state — see TransactionalRetryGuard (PRO-1733).
@@ -257,15 +282,93 @@ class EventsEndpoint {
 			if ( $n > 0 ) {
 				$plus->schedule_flush();
 				// A revived automation.abandoned_cart row is drained by the
-				// CartFlusher, not the main flush hook — kick it too so cart
-				// retries re-send promptly (PRO-1195).
-				$this->kick_flush( CartFlusher::FLUSH_HOOK, CartFlusher::AS_GROUP );
+				// CartFlusher, not the main flush hook — so its hook is
+				// covered separately (PRO-1195). Same next-scheduled-pass
+				// timing as every other revived row.
+				$this->ensure_flush_scheduled( CartFlusher::FLUSH_HOOK, CartFlusher::AS_GROUP );
 			}
 			TransactionalFlusher::revive( $plus, $retryable_transactional );
 			$reset += $n;
 		}
 
 		return new WP_REST_Response( array( 'reset' => $reset ), 200 );
+	}
+
+	/**
+	 * Send one already-sent confirmation to the shopper a SECOND time, on
+	 * explicit merchant request (PRO-2324). Body: { source, id }.
+	 *
+	 * This is NOT a retry: the row named here stays exactly as it is, and a
+	 * NEW row is enqueued for the same order + type, so the Event Log shows
+	 * both sends. It goes out on the transactional flusher's next scheduled
+	 * pass, within about a minute.
+	 *
+	 * Which rows may be sent again is TransactionalRetryGuard's rule, the
+	 * same one the list projection answers with `can_send_again` — the
+	 * button and the route can't drift apart.
+	 */
+	public function resend( WP_REST_Request $request ): WP_REST_Response {
+		$id = (int) $request->get_param( 'id' );
+
+		if ( $id <= 0 || (string) $request->get_param( 'source' ) !== self::SOURCE_SMAILY ) {
+			return new WP_REST_Response( array( 'error' => 'invalid_event_ref' ), 400 );
+		}
+
+		$row = $this->fetch_row( $this->smaily_table(), $id );
+
+		if ( $row === null ) {
+			return new WP_REST_Response( array( 'error' => 'not_found' ), 404 );
+		}
+
+		$event_type = (string) $row['event_type'];
+
+		// Whether the order still exists is the service's answer, not this
+		// route's: it loads the order anyway and says so with
+		// ERROR_ORDER_MISSING, which lands on the same refusal below.
+		if ( ! TransactionalRetryGuard::resendable( $event_type, (string) $row['status'], true ) ) {
+			return $this->resend_refused( 'resend_not_available' );
+		}
+
+		$resend = ( $this->resend_factory )();
+		$result = $resend->resend(
+			(int) $row['entity_id'],
+			$event_type,
+			TransactionalRetryGuard::to_status( (string) $row['payload'] )
+		);
+
+		if ( $result['error'] === TransactionalResend::ERROR_ORDER_MISSING ) {
+			// A row whose order is gone is simply not resendable — the same
+			// answer the list projection gives it.
+			return $this->resend_refused( 'resend_not_available' );
+		}
+
+		if ( $result['error'] !== '' ) {
+			return $this->resend_refused( $result['error'] );
+		}
+
+		return new WP_REST_Response(
+			array(
+				'queued' => 1,
+				'id'     => $result['id'],
+			),
+			200
+		);
+	}
+
+	/**
+	 * A refused "Send again", worded for the merchant (PRO-2369). The wording
+	 * belongs to TransactionalResend, beside the ERROR_* codes it maps — the
+	 * retry route's refusal is worded by TransactionalRetryGuard for the same
+	 * reason.
+	 */
+	private function resend_refused( string $error ): WP_REST_Response {
+		return new WP_REST_Response(
+			array(
+				'error'   => $error,
+				'message' => TransactionalResend::message( $error ),
+			),
+			409
+		);
 	}
 
 	/**
@@ -323,9 +426,13 @@ class EventsEndpoint {
 	}
 
 	/**
-	 * Deduplicated async kick for a single flush hook.
+	 * Make sure a flush pass is queued for a single hook. Deduplicated against
+	 * whatever is already scheduled on it — and the flusher's recurring action
+	 * always is, so in practice this is a no-op and the rows go out on the next
+	 * scheduled pass (PRO-2323). It is the safety net for a store whose
+	 * recurring action has gone missing, not a run-now kick.
 	 */
-	private function kick_flush( string $hook, string $group ): void {
+	private function ensure_flush_scheduled( string $hook, string $group ): void {
 		if ( ! function_exists( 'as_enqueue_async_action' ) ) {
 			return;
 		}
@@ -339,7 +446,8 @@ class EventsEndpoint {
 
 	/**
 	 * The rec queue is drained by four flushers, each on its own hook/group;
-	 * kick all so a reset row of any event type re-sends promptly.
+	 * cover all four so a reset row of any event type is picked up by its own
+	 * flusher's next scheduled pass.
 	 *
 	 * @return array<int, array{0: string, 1: string}>
 	 */
@@ -401,10 +509,16 @@ class EventsEndpoint {
 		$where_sql = $where === array() ? '' : ' WHERE ' . implode( ' AND ', $where );
 
 		$sql = sprintf(
-			'SELECT id, %s AS source, event_type, entity_id, status, attempts, %s AS max_attempts, last_error, created_at, %s AS retry_payload FROM %s%s',
+			'SELECT id, %s AS source, event_type, entity_id, status, attempts, %s AS max_attempts, last_error, created_at, %s AS retry_payload, %s AS last_response FROM %s%s',
 			$this->quote( $source ),
 			$max_attempts_expr,
-			$this->retry_payload_expr( $source ),
+			$this->conditional_column_expr(
+				$source,
+				'payload',
+				EventQueue::STATUS_FAILED,
+				' AND event_type IN ( ' . implode( ', ', array_map( array( $this, 'quote' ), TransactionalFlusher::EVENT_TYPES ) ) . ' )'
+			),
+			$this->conditional_column_expr( $source, 'last_response', EventQueue::STATUS_SENT ),
 			$table,
 			$where_sql
 		);
@@ -434,17 +548,30 @@ class EventsEndpoint {
 
 	/**
 	 * Shape a set of rows for the wire, resolving order existence for the
-	 * failed transactional rows among them in ONE batched lookup (PRO-1733)
-	 * — the guard takes existence as an input and does no I/O itself.
+	 * transactional rows among them in ONE batched lookup (PRO-1733) — the
+	 * guard takes existence as an input and does no I/O itself.
 	 *
 	 * @param array<int, array<string, mixed>> $rows
+	 * @param bool                             $with_send_again Whether
+	 *        `can_send_again` needs a real answer. False for a single-row
+	 *        drill-down, which renders no such button: a sent row then
+	 *        reports false without an order lookup.
 	 *
 	 * @return array<int, array<string, mixed>>
 	 */
-	private function shape_rows( array $rows ): array {
+	private function shape_rows( array $rows, bool $with_send_again = true ): array {
 		$entity_ids = array();
 		foreach ( $rows as $row ) {
-			if ( $this->is_failed_transactional( $row ) ) {
+			if ( ! $this->is_transactional( $row ) ) {
+				continue;
+			}
+			// Both transactional actions need to know whether the order is
+			// still there: Retry to refuse a row it can't rebuild (PRO-1733),
+			// "Send again" to offer itself at all (PRO-2324).
+			$status = (string) ( $row['status'] ?? '' );
+			if ( $status === EventQueue::STATUS_FAILED
+				|| ( $with_send_again && $status === EventQueue::STATUS_SENT )
+			) {
 				$entity_ids[] = (string) ( $row['entity_id'] ?? '' );
 			}
 		}
@@ -469,7 +596,7 @@ class EventsEndpoint {
 		// the sentence the Details panel shows. Only a FAILED transactional
 		// row can be refused, and only for those does the list query carry a
 		// payload (retry_payload); detail() reads the row's own payload.
-		$refusal = $this->is_failed_transactional( $row )
+		$refusal = $this->is_transactional( $row ) && (string) ( $row['status'] ?? '' ) === EventQueue::STATUS_FAILED
 			? TransactionalRetryGuard::refusal_reason(
 				(string) ( $row['event_type'] ?? '' ),
 				(string) ( $row['retry_payload'] ?? $row['payload'] ?? '' ),
@@ -489,15 +616,48 @@ class EventsEndpoint {
 			'created_at'            => isset( $row['created_at'] ) ? (string) $row['created_at'] : '',
 			'retry_refusal'         => $refusal,
 			'retry_refusal_message' => $refusal === '' ? '' : TransactionalRetryGuard::message( $refusal ),
+			// PRO-2372: a reminder withdrawn because the shopper bought first
+			// is terminal-marked `sent` like any other skip; the merchant
+			// must read "cancelled" on the row without opening Details.
+			'cancelled'             => EventQueue::is_cancelled_response( (string) ( $row['last_response'] ?? '' ) ),
+			// PRO-2324: may the merchant deliberately send this confirmation
+			// a second time? Only a transactional row Smaily itself sent, on
+			// an order that still exists.
+			'can_send_again'        => TransactionalRetryGuard::resendable(
+				(string) ( $row['event_type'] ?? '' ),
+				(string) ( $row['status'] ?? '' ),
+				$this->order_exists( (string) ( $row['entity_id'] ?? '' ), $existing_orders )
+			),
 		);
 	}
 
 	/**
+	 * Whether the row is one of the two transactional-email types — the only
+	 * rows either Event Log action applies to. Which action, and to which
+	 * status, is the caller's own compare.
+	 *
 	 * @param array<string, mixed> $row
 	 */
-	private function is_failed_transactional( array $row ): bool {
-		return (string) ( $row['status'] ?? '' ) === EventQueue::STATUS_FAILED
-			&& in_array( (string) ( $row['event_type'] ?? '' ), TransactionalFlusher::EVENT_TYPES, true );
+	private function is_transactional( array $row ): bool {
+		return in_array( (string) ( $row['event_type'] ?? '' ), TransactionalFlusher::EVENT_TYPES, true );
+	}
+
+	/**
+	 * One row of either queue by id, or null when there is none.
+	 *
+	 * @return array<string, mixed>|null
+	 */
+	private function fetch_row( string $table, int $id ): ?array {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$row = $wpdb->get_row(
+			$wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", $id ),
+			ARRAY_A
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		return is_array( $row ) ? $row : null;
 	}
 
 	/**
@@ -598,20 +758,31 @@ class EventsEndpoint {
 	}
 
 	/**
-	 * The list projection needs a transactional row's payload to tell a
-	 * re-fired-native-email failure from one the shopper never got
-	 * (PRO-1733) — but only for FAILED transactional rows, so a page of
-	 * ordinary events doesn't drag every payload out of the database.
+	 * One heavy column carried only for the rows that actually need it, the
+	 * empty literal for the rest — so a page of ordinary events doesn't drag
+	 * it out of the database. The rec queue needs neither of them, so it gets
+	 * the literal outright.
+	 *
+	 * `payload` is carried for FAILED transactional rows: the list reads it
+	 * to tell a re-fired-native-email failure from one the shopper never got
+	 * (PRO-1733). `last_response` is carried for SENT rows, where a withdrawn
+	 * abandoned-cart reminder records `cancelled` (PRO-1723) and the list must
+	 * label it as such (PRO-2372); a failed row's response is the big one
+	 * nobody needs here.
+	 *
+	 * @param string $extra_condition Already-quoted SQL appended to the status
+	 *                                test, or '' for none.
 	 */
-	private function retry_payload_expr( string $source ): string {
+	private function conditional_column_expr( string $source, string $column, string $status, string $extra_condition = '' ): string {
 		if ( $source !== self::SOURCE_SMAILY ) {
 			return "''";
 		}
 
 		return sprintf(
-			"CASE WHEN status = %s AND event_type IN ( %s ) THEN payload ELSE '' END",
-			$this->quote( EventQueue::STATUS_FAILED ),
-			implode( ', ', array_map( array( $this, 'quote' ), TransactionalFlusher::EVENT_TYPES ) )
+			"CASE WHEN status = %s%s THEN %s ELSE '' END",
+			$this->quote( $status ),
+			$extra_condition,
+			$column
 		);
 	}
 

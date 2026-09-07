@@ -1,6 +1,7 @@
 <?php
 /**
- * Decides whether a failed transactional-email row may be retried (PRO-1733).
+ * Decides which Event Log actions a transactional-email row offers
+ * (PRO-1733 retry, PRO-2324 send-again).
  *
  * @package Smaily\Connect\Smaily
  */
@@ -34,6 +35,14 @@ defined( 'ABSPATH' ) || exit;
  *
  * A transactional row whose order can no longer be loaded is refused too:
  * a retry would rebuild nothing and fail-open has no order to fall back on.
+ *
+ * One case is neither: a deliberate second confirmation (PRO-2324) that
+ * failed. Nothing was sent for it — a re-send never fails open — so it is
+ * refused like the rest, but with its own sentence (PRO-2368).
+ *
+ * The same class also answers the opposite question — may a row Smaily
+ * already sent be sent AGAIN, deliberately (resendable(), PRO-2324) — so
+ * both Event Log actions read one set of rules about the same rows.
  */
 final class TransactionalRetryGuard {
 
@@ -42,6 +51,13 @@ final class TransactionalRetryGuard {
 
 	/** The order behind the row is gone — there is nothing left to send. */
 	public const REASON_ORDER_MISSING = 'order_missing';
+
+	/**
+	 * A deliberate second confirmation (PRO-2324) that failed. It never fails
+	 * open — the shopper already has the first confirmation — so the
+	 * WooCommerce-email sentence below would be false on it.
+	 */
+	public const REASON_RESEND_FAILED = 'resend_failed';
 
 	/**
 	 * @param bool $order_exists Whether the row's order still loads —
@@ -59,8 +75,10 @@ final class TransactionalRetryGuard {
 			return self::REASON_ORDER_MISSING;
 		}
 
+		$payload = TransactionalFlusher::read_payload( $payload_json );
+
 		if ( $event_type !== TransactionalFlusher::EVENT_TYPE_SHIPPING_CONFIRMATION ) {
-			return self::REASON_WC_EMAIL_SENT;
+			return self::wc_email_reason( $payload );
 		}
 
 		// A shipping confirmation into `completed` replaced — and, on
@@ -69,15 +87,58 @@ final class TransactionalRetryGuard {
 		// nothing reached the shopper. An absent to_status (a row from
 		// before it was stored, or an undecodable payload) is treated as the
 		// `completed` case: never risk a second confirmation.
-		$to_status = self::to_status( $payload_json );
+		$to_status = self::to_status_of( $payload );
 
-		return ( $to_status !== '' && $to_status !== 'completed' ) ? '' : self::REASON_WC_EMAIL_SENT;
+		return ( $to_status !== '' && $to_status !== 'completed' ) ? '' : self::wc_email_reason( $payload );
+	}
+
+	/**
+	 * Which "the shopper already has a confirmation" sentence a refused row
+	 * gets. A re-send row that failed sent nothing at all (PRO-2368):
+	 * fail-open is deliberately off for it, so the reason it would otherwise
+	 * be refused with — "WooCommerce sent its own email instead" — never
+	 * happened. The refusal itself is unchanged, and so is the case where a
+	 * retry is the shopper's only route to a confirmation; only the sentence
+	 * differs.
+	 *
+	 * @param array<string, mixed>|null $payload The row's decoded payload,
+	 *                                           null when it doesn't decode.
+	 */
+	private static function wc_email_reason( ?array $payload ): string {
+		return empty( $payload[ TransactionalFlusher::PAYLOAD_KEY_RESEND ] )
+			? self::REASON_WC_EMAIL_SENT
+			: self::REASON_RESEND_FAILED;
+	}
+
+	/**
+	 * Whether a row may be sent to the shopper a SECOND time on explicit
+	 * merchant request — the Event Log's "Send again" action (PRO-2324).
+	 *
+	 * Only a transactional row Smaily itself sent qualifies. `sent` is
+	 * written by TransactionalFlusher only after Smaily replied
+	 * {code:101}, so the "WooCommerce sent its own email instead" case
+	 * (fail-open) can never reach it: that row is `failed`, and which of
+	 * those may be RE-driven is refusal_reason()'s question, not this one.
+	 * The order must still exist — a re-send rebuilds its content from the
+	 * live order.
+	 *
+	 * @param bool $order_exists Resolved by the caller, never here — same
+	 *                           batched lookup refusal_reason() takes.
+	 */
+	public static function resendable( string $event_type, string $status, bool $order_exists ): bool {
+		return self::is_transactional( $event_type )
+			&& $status === EventQueue::STATUS_SENT
+			&& $order_exists;
 	}
 
 	/** The merchant-readable reason a retry was refused. */
 	public static function message( string $reason ): string {
 		if ( $reason === self::REASON_ORDER_MISSING ) {
 			return __( 'This order no longer exists, so this event cannot be re-sent.', 'smaily-connect' );
+		}
+
+		if ( $reason === self::REASON_RESEND_FAILED ) {
+			return __( 'This second confirmation could not be sent. The confirmation the customer already received still stands.', 'smaily-connect' );
 		}
 
 		return __( 'This confirmation was already sent to the shopper as the standard WooCommerce email; it cannot be re-sent.', 'smaily-connect' );
@@ -87,9 +148,22 @@ final class TransactionalRetryGuard {
 		return in_array( $event_type, TransactionalFlusher::EVENT_TYPES, true );
 	}
 
-	private static function to_status( string $payload_json ): string {
-		$payload = TransactionalFlusher::read_payload( $payload_json );
+	/**
+	 * The order status a transactional row was enqueued for, read out of the
+	 * stored payload this class already owns the shape of. '' when the row
+	 * predates the field or its JSON doesn't decode.
+	 */
+	public static function to_status( string $payload_json ): string {
+		return self::to_status_of( TransactionalFlusher::read_payload( $payload_json ) );
+	}
 
+	/**
+	 * The same answer for a payload already decoded — refusal_reason() reads
+	 * the payload once and asks both questions of it.
+	 *
+	 * @param array<string, mixed>|null $payload
+	 */
+	private static function to_status_of( ?array $payload ): string {
 		return isset( $payload['to_status'] ) ? (string) $payload['to_status'] : '';
 	}
 }

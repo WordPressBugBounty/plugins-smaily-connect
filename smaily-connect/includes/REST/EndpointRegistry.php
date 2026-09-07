@@ -17,6 +17,7 @@ use Smaily\Connect\Smaily\BackfillJobInterface;
 use Smaily\Connect\Smaily\Client;
 use Smaily\Connect\Smaily\RecEngine\Client as RecEngineClient;
 use Smaily\Connect\Smaily\RecEngine\SetupExchange;
+use Smaily\Connect\Smaily\TransactionalResend;
 
 /**
  * One source of truth for the plugin's `/wp-json/smaily-connect/v1/*`
@@ -77,7 +78,15 @@ final class EndpointRegistry {
 				}
 			),
 			new SettingsEndpoint(),
-			new EventsEndpoint(),
+			new EventsEndpoint(
+				// "Send again" (PRO-2324) runs the same gate + payload
+				// builder a first confirmation does. Built on demand: the
+				// Event Log's read routes are the common case and must not
+				// pay for the transactional graph on every rest_api_init.
+				static function () use ( $bootstrap ): TransactionalResend {
+					return $bootstrap->transactional_resend();
+				}
+			),
 			new RecEngineEndpoint(
 				new RecEngineSettings(),
 				static function (): SetupExchange {
@@ -163,6 +172,10 @@ final class EndpointRegistry {
 			array(
 				'method' => 'POST',
 				'path'   => '/events/retry',
+			),
+			array(
+				'method' => 'POST',
+				'path'   => '/events/resend',
 			),
 			array(
 				'method' => 'POST',
