@@ -116,6 +116,7 @@ class ComposerStaticInitc9bd3d1d72511ce8fa30a9390fed4aef
         'Smaily\\Connect\\Smaily\\WorkflowResolverInterface' => __DIR__ . '/../..' . '/includes/Smaily/WorkflowResolverInterface.php',
         'Smaily\\Connect\\Support\\ContactLanguageResolver' => __DIR__ . '/../..' . '/includes/Support/ContactLanguageResolver.php',
         'Smaily\\Connect\\Support\\DebugLog' => __DIR__ . '/../..' . '/includes/Support/DebugLog.php',
+        'Smaily\\Connect\\Support\\UpgradeLock' => __DIR__ . '/../..' . '/includes/Support/UpgradeLock.php',
         'Smaily\\Connect\\Wizard\\EnvDetector' => __DIR__ . '/../..' . '/includes/Wizard/EnvDetector.php',
     );
 

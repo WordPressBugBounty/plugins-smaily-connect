@@ -38,6 +38,7 @@ use Smaily\Connect\REST\EndpointRegistry;
 use Smaily\Connect\Settings\Credentials;
 use Smaily\Connect\Settings\RecEngineSettings;
 use Smaily\Connect\Settings\SetupState;
+use Smaily\Connect\Support\UpgradeLock;
 use Smaily\Connect\Smaily\AutomationRouter;
 use Smaily\Connect\Smaily\CartAbandonmentSweeper;
 use Smaily\Connect\Smaily\CartFlusher;
@@ -94,6 +95,21 @@ use Smaily\Connect\Smaily\WorkflowResolverInterface;
  * queues etc.) without breaking the per-request caching for production.
  */
 final class Bootstrap {
+
+	/**
+	 * Timestamp marker (autoload=false): the Unix time at which the recurring
+	 * Action Scheduler jobs were last all verified present. Activation,
+	 * upgrade and deactivation delete it (PRO-2437).
+	 */
+	public const OPTION_AS_JOBS_VERIFIED = 'smly_plus_as_jobs_verified';
+
+	/**
+	 * How long a verification is trusted. An hour is long enough that the
+	 * eleven existence queries stop being a per-request cost, and short
+	 * enough that a job lost outside the plugin's own lifecycle comes back
+	 * on its own.
+	 */
+	public const AS_JOBS_VERIFIED_TTL = 3600;
 
 	private static ?self $instance = null;
 
@@ -598,7 +614,23 @@ final class Bootstrap {
 			return;
 		}
 
-		Activation::run();
+		// PRO-2434: one runner at a time — admin_init fires for every
+		// admin-ajax request too, and a long migration must not be started
+		// N times in parallel by the requests that arrive while it runs.
+		$lock = new UpgradeLock();
+		if ( ! $lock->acquire() ) {
+			return;
+		}
+
+		try {
+			if ( function_exists( 'set_time_limit' ) ) {
+				// phpcs:ignore Squiz.PHP.DiscouragedFunctions.Discouraged -- What core's WP_Upgrader allows itself.
+				set_time_limit( 300 );
+			}
+			Activation::run();
+		} finally {
+			$lock->release();
+		}
 	}
 
 	/**
@@ -606,9 +638,15 @@ final class Bootstrap {
 	 *
 	 * Idempotent — `as_has_scheduled_action()` skips the schedule call
 	 * when a row already exists. Activation seeds the same actions; this
-	 * `init` registration re-runs every request so a deactivation /
-	 * reactivation that cancelled the recurring rows restores them
-	 * without the user having to re-save Settings.
+	 * `init` registration re-runs so a deactivation / reactivation that
+	 * cancelled the recurring rows restores them without the user having
+	 * to re-save Settings.
+	 *
+	 * Verified at most once an hour (PRO-2437). Each existence check is a
+	 * SELECT with a group JOIN on a table that grows into the hundreds of
+	 * thousands of rows on a busy store, and the set only changes on
+	 * activation, upgrade or deactivation — all of which clear the marker,
+	 * so those re-arm on the very next request rather than within the hour.
 	 *
 	 *   smly_plus_flush_event_queue   — every 60 seconds — Flusher::flush()
 	 *   smly_plus_retry_failed_events — every 5 minutes  — same callback,
@@ -618,6 +656,11 @@ final class Bootstrap {
 	 */
 	public function register_action_scheduler_jobs(): void {
 		if ( ! function_exists( 'as_has_scheduled_action' ) || ! function_exists( 'as_schedule_recurring_action' ) ) {
+			return;
+		}
+
+		$verified_at = (int) get_option( self::OPTION_AS_JOBS_VERIFIED, 0 );
+		if ( $verified_at > time() - self::AS_JOBS_VERIFIED_TTL ) {
 			return;
 		}
 
@@ -688,6 +731,8 @@ final class Bootstrap {
 		if ( ! as_has_scheduled_action( QueueJanitor::HOOK, array(), QueueJanitor::AS_GROUP ) ) {
 			as_schedule_recurring_action( time(), DAY_IN_SECONDS, QueueJanitor::HOOK, array(), QueueJanitor::AS_GROUP );
 		}
+
+		update_option( self::OPTION_AS_JOBS_VERIFIED, time(), false );
 	}
 
 	/**

@@ -101,5 +101,6 @@ return array(
     'Smaily\\Connect\\Smaily\\WorkflowResolverInterface' => $baseDir . '/includes/Smaily/WorkflowResolverInterface.php',
     'Smaily\\Connect\\Support\\ContactLanguageResolver' => $baseDir . '/includes/Support/ContactLanguageResolver.php',
     'Smaily\\Connect\\Support\\DebugLog' => $baseDir . '/includes/Support/DebugLog.php',
+    'Smaily\\Connect\\Support\\UpgradeLock' => $baseDir . '/includes/Support/UpgradeLock.php',
     'Smaily\\Connect\\Wizard\\EnvDetector' => $baseDir . '/includes/Wizard/EnvDetector.php',
 );

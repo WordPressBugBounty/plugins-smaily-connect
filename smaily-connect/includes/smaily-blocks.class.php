@@ -52,6 +52,11 @@ class Blocks {
 	 */
 	public function register_checkout_optin_block() {
 		register_block_type( SMAILY_CONNECT_PLUGIN_PATH . '/blocks/checkout-optin/build' );
+		// block.json registers editorScript in the header; its wc-settings /
+		// wc-blocks-checkout dependencies must load in the footer, and
+		// WooCommerce otherwise moves it itself with a console warning
+		// (PRO-2436).
+		wp_script_add_data( 'smaily-checkout-optin-editor-script', 'group', 1 );
 		wp_set_script_translations(
 			'smaily-checkout-optin-editor-script',
 			'smaily-connect',
@@ -106,6 +111,14 @@ class Blocks {
 			'smaily-landingpage-block-editor-script',
 			'smaily-connect',
 			SMAILY_CONNECT_PLUGIN_PATH . 'languages'
+		);
+
+		// The shortcode is the landing page's other surface, kept beside the
+		// block it mirrors (PRO-2440). Its render path is a static call, so it
+		// does not depend on where add_shortcode() runs.
+		add_shortcode(
+			'smaily_landing_page',
+			array( 'Smaily_Connect\\Blocks\\Landing_Page\\Integration', 'render_shortcode' )
 		);
 	}
 }

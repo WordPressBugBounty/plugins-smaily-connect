@@ -54,9 +54,11 @@ final class Activation {
 		self::run_migrations();
 		self::drain_legacy_abandoned_carts();
 		self::cleanup_retired_options();
+		self::purge_autoloaded_profiling_cache();
 		self::reencrypt_legacy_secrets();
 		self::migrate_wp_cron_to_action_scheduler();
 		self::schedule_recurring_action_scheduler_jobs();
+		self::clear_action_scheduler_verification();
 		self::stamp_plugin_version();
 	}
 
@@ -183,6 +185,28 @@ final class Activation {
 	}
 
 	/**
+	 * Before PRO-2435 the ProfilingConsent stale cache was written as a
+	 * no-expiry transient — an AUTOLOADED wp_options row per contact that
+	 * nothing ever removed (`alloptions` grew with the customer base). Drop
+	 * every stale-cache row on upgrade so an affected store recovers; the
+	 * rows the fixed code writes are cheap to lose (they only serve a read
+	 * error, and the durable opt-out registry is untouched).
+	 */
+	private static function purge_autoloaded_profiling_cache(): void {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- one-time prefix sweep on upgrade; per-row delete_transient() would need the full list first.
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+				$wpdb->esc_like( '_transient_smly_profiling_stale_' ) . '%',
+				$wpdb->esc_like( '_transient_timeout_smly_profiling_stale_' ) . '%'
+			)
+		);
+		wp_cache_delete( 'alloptions', 'options' );
+	}
+
+	/**
 	 * Record the version this run completed for, so the admin_init
 	 * upgrade-detect settles to a single get_option() no-op until the next
 	 * version bump.
@@ -247,10 +271,10 @@ final class Activation {
 	 *   smly_plus_abandoned_cart — 15 min, bridges to the two abandoned_cart_* legacy hooks
 	 *
 	 * smly_plus_flush_event_queue + smly_plus_retry_failed_events are
-	 * scheduled by Bootstrap::register_action_scheduler_jobs on init for
-	 * every request; the activation hook only seeds the two cart/sync
-	 * recurring rows because those need the daily / 15-min cadence rather
-	 * than the queue's tight 60s flush loop.
+	 * scheduled by Bootstrap::register_action_scheduler_jobs on init; the
+	 * activation hook only seeds the two cart/sync recurring rows because
+	 * those need the daily / 15-min cadence rather than the queue's tight
+	 * 60s flush loop.
 	 */
 	private static function schedule_recurring_action_scheduler_jobs(): void {
 		if ( ! function_exists( 'as_has_scheduled_action' ) || ! function_exists( 'as_schedule_recurring_action' ) ) {
@@ -276,6 +300,16 @@ final class Activation {
 				EventQueue::AS_GROUP
 			);
 		}
+	}
+
+	/**
+	 * Drop the "recurring jobs verified" marker so the next `init` re-checks
+	 * the whole recurring set instead of trusting an up-to-an-hour-old
+	 * verification (PRO-2437). Activation is also the upgrade path, so a
+	 * release that adds a recurring job arms it on the very next request.
+	 */
+	private static function clear_action_scheduler_verification(): void {
+		delete_option( Bootstrap::OPTION_AS_JOBS_VERIFIED );
 	}
 
 	private function __construct() {

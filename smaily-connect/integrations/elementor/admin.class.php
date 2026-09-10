@@ -14,7 +14,7 @@ class Admin {
 		add_action( 'elementor/elements/categories_registered', array( $this, 'add_elementor_category' ) );
 		add_action( 'elementor/frontend/after_register_styles', array( $this, 'register_frontend_styles' ) );
 		add_action( 'elementor/frontend/after_enqueue_styles', array( $this, 'enqueue_frontend_styles' ) );
-		add_action( 'elementor/widgets/register', array( $this, 'register_newsletter_widget' ) );
+		add_action( 'elementor/widgets/register', array( $this, 'register_widgets' ) );
 	}
 
 	/**
@@ -33,18 +33,20 @@ class Admin {
 	}
 
 	/**
-	 * Register the newsletter widget with Elementor.
+	 * Register the Smaily widgets with Elementor.
 	 *
 	 * @param \Elementor\Widgets_Manager $widgets_manager The Elementor widget manager instance.
 	 */
-	public function register_newsletter_widget( $widgets_manager ) {
+	public function register_widgets( $widgets_manager ) {
 		if ( ! class_exists( 'Elementor\Widget_Base' ) ) {
 			return;
 		}
 
 		require_once __DIR__ . '/newsletter-widget.class.php';
+		require_once __DIR__ . '/landingpage-widget.class.php';
 
 		$widgets_manager->register( new Newsletter_Widget() );
+		$widgets_manager->register( new Landingpage_Widget() );
 	}
 
 	/**
