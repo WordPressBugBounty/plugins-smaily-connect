@@ -2,7 +2,7 @@
 /*
  * Author URI:           https://smaily.com
  * Author:               Smaily
- * Description:          Connect your WooCommerce shop to Smaily for email marketing, automation, and personalised recommendations. (BETA: extended e-commerce sync and Smaily Campaign Intelligence integration.)
+ * Description:          Connect your WooCommerce shop to Smaily for email marketing, automation, and personalised recommendations.
  * Domain Path:          /languages
  * License URI:          https://www.gnu.org/licenses/gpl-3.0.en.html
  * License:              GPL-3.0+
@@ -13,7 +13,7 @@
  * Plugin Name:          Smaily Connect
  * Plugin URI:           https://smaily.com/help/user-manual/smaily-connect-for-wordpress/
  * Text Domain:          smaily-connect
- * Version:              3.13.0
+ * Version:              3.14.0
 */
 
 // Exit if accessed directly.
@@ -24,13 +24,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Current plugin version (PSR-4 callers should prefer Smaily\Connect\Constants::version()).
  */
-define( 'SMAILY_CONNECT_VERSION', '3.13.0' );
+define( 'SMAILY_CONNECT_VERSION', '3.14.0' );
 
 /**
  * Legacy version constant — kept for upstream compatibility (used by older
  * classes that still reference it). New code should use SMAILY_CONNECT_VERSION.
  */
-define( 'SMAILY_CONNECT_PLUGIN_VERSION', '3.13.0' );
+define( 'SMAILY_CONNECT_PLUGIN_VERSION', '3.14.0' );
 
 /**
  * The name of the plugin.

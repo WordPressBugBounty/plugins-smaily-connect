@@ -122,6 +122,18 @@ class ProfilingConsent {
 			try {
 				$consent = $client->get_contact_consent( $email );
 				$allowed = self::is_allowed( $consent['is_unsubscribed'], $consent['smaily_rec_profiling'] );
+				if ( $allowed && $consent['smaily_rec_profiling'] !== '1' && $this->is_durably_opted_out( $email ) ) {
+					// PRO-3191: a durable store-side opt-out holds until an
+					// EXPLICIT opt-in ('1' here, or opt_in()). A contact with no
+					// preference (or no contact at all) is not one — it is an
+					// opt-out whose Smaily write never landed.
+					$allowed = false;
+					if ( $consent['found'] && ( $consent['smaily_rec_profiling'] ?? '' ) === '' ) {
+						// Carry the opt-out to the contact that lacks it. Never
+						// for a not-found contact: the upsert would create one.
+						$this->write( $email, false );
+					}
+				}
 				$this->remember( $email, $allowed );
 				if ( ! $allowed ) {
 					$this->engine_opt_out( $email );
@@ -145,6 +157,27 @@ class ProfilingConsent {
 	 * (DECISIONS F3-31 — the merchant's accepted residual risk).
 	 */
 	private function fallback_on_error( string $email ): bool {
+		return $this->stored_preference( $email ) ?? true;
+	}
+
+	/**
+	 * The preference as far as it is actually KNOWN — for display only (the
+	 * My Account section, PRO-2513). Null means nothing reliable is known:
+	 * exactly the case where `may_profile()` fails open, and where the daily
+	 * cache may hold that fail-open `true`, so the cache can't be trusted for
+	 * display. Calls `may_profile()` first so a cache miss still reads back
+	 * from Smaily as before; the gate's answer and its caches are unchanged.
+	 */
+	public function known_preference( string $email ): ?bool {
+		$this->may_profile( $email );
+		return $this->stored_preference( $email );
+	}
+
+	/**
+	 * What we durably know without a fresh read: a durable opt-out, else the
+	 * last successfully fetched (or WP-side set) state, else null.
+	 */
+	private function stored_preference( string $email ): ?bool {
 		if ( $this->is_durably_opted_out( $email ) ) {
 			return false;
 		}
@@ -154,7 +187,7 @@ class ProfilingConsent {
 			return $stale === '1';
 		}
 
-		return true;
+		return null;
 	}
 
 	/**
@@ -244,8 +277,9 @@ class ProfilingConsent {
 	/**
 	 * Durable opt-out registry (autoload=false option, keyed by hashed email —
 	 * stores only opt-outs, so it stays bounded to the merchant's actual
-	 * opt-out count, not the whole contact base). An opt-in fetch removes the
-	 * entry; only the engine's own answer can clear a durable opt-out.
+	 * opt-out count, not the whole contact base). Only an explicit opt-in
+	 * removes the entry — a read-back of `smaily_rec_profiling = 1`, or a
+	 * WP-side opt_in() (PRO-3191); a contact with no preference never does.
 	 */
 	private function remember_optout( string $email, bool $allowed ): void {
 		$key       = self::email_hash( $email );
