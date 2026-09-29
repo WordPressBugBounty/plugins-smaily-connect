@@ -158,29 +158,28 @@ class Client {
 	 * `{code:206, message:"Could not find requested email address"}` status on a
 	 * miss (HTTP 200 either way — probe-confirmed against the live API).
 	 *
-	 * @return array{found: bool, is_unsubscribed: ?string, smaily_rec_profiling: ?string}
+	 * @return array{found: bool, is_unsubscribed: ?string, smaily_rec_profiling: ?string, smaily_rec_profiling_ts: ?string}
 	 *         Values come back as STRINGS ("0"/"1") — callers compare as strings.
+	 *         `smaily_rec_profiling_ts` is the moment the preference was written
+	 *         (as `write_profiling_consent()` sent it), or null when absent.
 	 */
 	public function get_contact_consent( string $email ): array {
 		$body = $this->request( 'GET', 'contact', array( 'email' => $email ) );
+		$keys = array( 'is_unsubscribed', 'smaily_rec_profiling', 'smaily_rec_profiling_ts' );
 
 		// A status payload ({code, message}) = not-found / error, never a contact.
 		if ( ! is_array( $body ) || isset( $body['code'] ) ) {
-			return array(
-				'found'                => false,
-				'is_unsubscribed'      => null,
-				'smaily_rec_profiling' => null,
-			);
+			return array( 'found' => false ) + array_fill_keys( $keys, null );
 		}
 
 		// The hit is a contact object, or a single-element list of one.
 		$contact = isset( $body[0] ) && is_array( $body[0] ) ? $body[0] : $body;
 
-		return array(
-			'found'                => true,
-			'is_unsubscribed'      => isset( $contact['is_unsubscribed'] ) ? (string) $contact['is_unsubscribed'] : null,
-			'smaily_rec_profiling' => isset( $contact['smaily_rec_profiling'] ) ? (string) $contact['smaily_rec_profiling'] : null,
-		);
+		$consent = array( 'found' => true );
+		foreach ( $keys as $key ) {
+			$consent[ $key ] = isset( $contact[ $key ] ) ? (string) $contact[ $key ] : null;
+		}
+		return $consent;
 	}
 
 	/**
