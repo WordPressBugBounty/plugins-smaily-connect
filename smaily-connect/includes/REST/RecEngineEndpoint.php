@@ -13,6 +13,7 @@ defined( 'ABSPATH' ) || exit;
 
 use Smaily\Connect\Constants;
 use Smaily\Connect\Settings\RecEngineSettings;
+use Smaily\Connect\Smaily\RecEngine\Backfill\CatalogImportOnConnect;
 use Smaily\Connect\Smaily\RecEngine\ApiException;
 use Smaily\Connect\Smaily\RecEngine\Client;
 use Smaily\Connect\Smaily\RecEngine\ExchangeResult;
@@ -25,7 +26,8 @@ use WP_REST_Response;
  * Three sub-routes under `/wp-json/smaily-connect/v1/rec-engine/...`:
  *
  *   POST /rec-engine/setup-exchange  body: { setup_url, [base_url] }
- *     → 200 { connected: true, tenantName, tenantId, engineVersion }
+ *     → 200 { connected: true, tenantName, tenantId, engineVersion,
+ *             catalogImport: 'started'|'unchanged' }
  *     → 400 { error: 'token_expired_or_used', regenerateUrl }
  *     → 400 { error: 'token_not_found' }
  *     → 502 { error: 'engine_unreachable', reason }
@@ -60,17 +62,28 @@ class RecEngineEndpoint {
 	private $client_factory;
 
 	/**
+	 * Runs once a connection is saved; answers whether it started the catalog
+	 * import (PRO-3743).
+	 *
+	 * @var callable(): bool
+	 */
+	private $on_connected;
+
+	/**
 	 * @param callable(): SetupExchange                              $exchange_factory
 	 * @param callable(string $api_key, string $base_url): Client    $client_factory
+	 * @param callable(): bool                                       $on_connected
 	 */
 	public function __construct(
 		RecEngineSettings $settings,
 		callable $exchange_factory,
-		callable $client_factory
+		callable $client_factory,
+		callable $on_connected
 	) {
 		$this->settings         = $settings;
 		$this->exchange_factory = $exchange_factory;
 		$this->client_factory   = $client_factory;
+		$this->on_connected     = $on_connected;
 	}
 
 	public function register(): void {
@@ -160,19 +173,36 @@ class RecEngineEndpoint {
 			);
 		}
 
+		// PRO-3623: the token is sent only to https://intelligence.smaily.com.
+		// SetupExchange::exchange() refuses the same; checking here first
+		// gives the merchant a message that says what is wrong.
+		if ( ! SetupExchange::is_allowed_engine_url( $base ) ) {
+			return new WP_REST_Response(
+				array(
+					'connected' => false,
+					'error'     => 'invalid_setup_url',
+					'message'   => __( 'This setup link does not point to Smaily Campaign Intelligence. Copy the setup link again from your Smaily account — it starts with https://intelligence.smaily.com/setup/.', 'smaily-connect' ),
+				),
+				400
+			);
+		}
+
 		$result = ( $this->exchange_factory )()->exchange( $parsed['token'], $base );
 
 		switch ( $result->kind ) {
 			case ExchangeResult::KIND_SUCCESS:
 				$this->settings->store( $result );
+				$import_started = ( $this->on_connected )();
 				return new WP_REST_Response(
 					array(
-						'connected'     => true,
-						'tenantName'    => $result->tenant_name,
-						'tenantId'      => $result->tenant_id,
-						'engineVersion' => $result->engine_version,
-						'baseUrl'       => $result->engine_base_url,
-						'issuedAt'      => $result->issued_at,
+						'connected'                 => true,
+						'tenantName'                => $result->tenant_name,
+						'tenantId'                  => $result->tenant_id,
+						'engineVersion'             => $result->engine_version,
+						'baseUrl'                   => $result->engine_base_url,
+						'issuedAt'                  => $result->issued_at,
+						'catalogImport'             => $import_started ? 'started' : 'unchanged',
+						'catalogImportDelaySeconds' => CatalogImportOnConnect::DELAY_SECONDS,
 					),
 					200
 				);
@@ -196,6 +226,16 @@ class RecEngineEndpoint {
 						'message'   => __( 'Setup token not recognised. Verify the URL is correct.', 'smaily-connect' ),
 					),
 					400
+				);
+
+			case ExchangeResult::KIND_HOST_NOT_ALLOWED:
+				return new WP_REST_Response(
+					array(
+						'connected' => false,
+						'error'     => 'engine_unreachable',
+						'message'   => __( 'Smaily Campaign Intelligence replied with an address outside https://intelligence.smaily.com, so the connection was not saved. Contact Smaily support.', 'smaily-connect' ),
+					),
+					502
 				);
 
 			case ExchangeResult::KIND_ENGINE_UNREACHABLE:

@@ -12,6 +12,7 @@ namespace Smaily\Connect\REST;
 defined( 'ABSPATH' ) || exit;
 
 use Smaily\Connect\Bootstrap;
+use Smaily\Connect\Integrations\WooCommerce\StorefrontRecommendations;
 use Smaily\Connect\Settings\RecEngineSettings;
 use Smaily\Connect\Smaily\BackfillJobInterface;
 use Smaily\Connect\Smaily\Client;
@@ -94,6 +95,11 @@ final class EndpointRegistry {
 				},
 				static function ( string $api_key, string $base_url ): RecEngineClient {
 					return new RecEngineClient( $api_key, $base_url );
+				},
+				// Connecting starts the full catalog import (PRO-3743) through
+				// the same products job the "Import now" button starts.
+				static function () use ( $bootstrap ): bool {
+					return $bootstrap->catalog_import_on_connect()->start();
 				}
 			),
 			new AutomationsEndpoint(
@@ -114,6 +120,12 @@ final class EndpointRegistry {
 				// (a).1: the beacon's profiling gate — drop browse events for an
 				// opted-out known contact before they reach the engine.
 				$bootstrap->profiling_consent()
+			),
+			new RecommendationsEndpoint(
+				new RecEngineSettings(),
+				static function () use ( $bootstrap ): StorefrontRecommendations {
+					return $bootstrap->storefront_recommendations();
+				}
 			),
 		);
 	}
@@ -209,6 +221,12 @@ final class EndpointRegistry {
 			array(
 				'method' => 'POST',
 				'path'   => '/relay',
+			),
+			// The public storefront recommendations the block's script asks
+			// for (PRO-3835). Gated in the handler like /relay.
+			array(
+				'method' => 'GET',
+				'path'   => '/recommendations',
 			),
 		);
 	}

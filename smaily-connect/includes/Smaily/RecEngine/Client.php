@@ -35,6 +35,8 @@ defined( 'ABSPATH' ) || exit;
  *   - 5xx (500/502/503/504) → same backoff, max 5 attempts.
  *   - 4xx (non-429) → no retry, throw ApiException with the body's
  *     error_code so the caller can branch on `api_key_revoked` etc.
+ *   - Exception: ingest_browse() (the storefront `/relay` forward) makes
+ *     ONE short attempt and never retries or waits (PRO-3620).
  *
  * Version handling (contract §3): every response carries
  * `X-Engine-Version`. The client warns (error_log) on a major-version
@@ -108,9 +110,24 @@ class Client {
 	// every existing connection, not just the rare pre-exchange call.
 	public const PATH_AUTOMATIONS_CATALOG = '/api/v1/automations/catalog';
 	public const PATH_AUTOMATIONS_CONFIG  = '/api/v1/automations/config';
+	// Storefront recommendations (contract v1.9.0, §15). Map key
+	// `recommendations_customer`; a connection exchanged before v1.9.0 has no
+	// such key, so this fallback serves every existing connection.
+	public const PATH_RECOMMENDATIONS_CUSTOMER = '/api/v1/recommendations/customer';
 
 	/** Default in-request retry ceiling — generous for one-shot calls (ping, setup). */
 	public const DEFAULT_MAX_ATTEMPTS = 5;
+
+	/**
+	 * The whole-request bound, connect included, on a browse forward
+	 * (PRO-3620). Browse is sent from inside a shopper's storefront request
+	 * (the `/relay` proxy), so it gets one attempt of at most this long — the
+	 * same bound the Magento relay uses (PRO-3575).
+	 */
+	public const BROWSE_TIMEOUT_SECONDS = 3;
+
+	/** Default per-request HTTP timeout, in seconds. */
+	public const DEFAULT_TIMEOUT_SECONDS = 15;
 
 	private string $api_key;
 	private string $base_url;
@@ -121,6 +138,8 @@ class Client {
 	private int $max_attempts;
 
 	private RecEngineSettings $settings;
+
+	private int $timeout_seconds;
 
 	/**
 	 * @param string                $api_key      Bearer key, e.g. "sk_8f3k2a...".
@@ -134,13 +153,17 @@ class Client {
 	 *                                            already retries at the row level via next_retry_at.
 	 * @param RecEngineSettings     $settings     Where a refusal is persisted (PRO-1893). Optional so
 	 *                                            no call site has to change.
+	 * @param int                   $timeout_seconds Per-request HTTP timeout. A storefront render
+	 *                                            passes a short one (§15: a slow engine must not
+	 *                                            hold up the shopper's page).
 	 */
-	public function __construct( string $api_key, string $base_url, array $endpoints = array(), int $max_attempts = self::DEFAULT_MAX_ATTEMPTS, ?RecEngineSettings $settings = null ) {
-		$this->api_key      = $api_key;
-		$this->base_url     = rtrim( $base_url, '/' );
-		$this->endpoints    = $endpoints;
-		$this->max_attempts = max( 1, $max_attempts );
-		$this->settings     = $settings ?? new RecEngineSettings();
+	public function __construct( string $api_key, string $base_url, array $endpoints = array(), int $max_attempts = self::DEFAULT_MAX_ATTEMPTS, ?RecEngineSettings $settings = null, int $timeout_seconds = self::DEFAULT_TIMEOUT_SECONDS ) {
+		$this->api_key         = $api_key;
+		$this->base_url        = rtrim( $base_url, '/' );
+		$this->endpoints       = $endpoints;
+		$this->max_attempts    = max( 1, $max_attempts );
+		$this->settings        = $settings ?? new RecEngineSettings();
+		$this->timeout_seconds = max( 1, $timeout_seconds );
 	}
 
 	/**
@@ -305,6 +328,13 @@ class Client {
 	 * acceptable). A wrapper-level failure (non-array / empty / >100) is a 400
 	 * and throws ApiException carrying the body's `details` (F3-18).
 	 *
+	 * PRO-3620: because the beacon proxy forwards from inside a shopper's
+	 * request, this is ONE attempt bounded by BROWSE_TIMEOUT_SECONDS, with no
+	 * redirect, no retry and no back-off or Retry-After wait — whatever
+	 * `$max_attempts` the client was built with. A slow, failing or
+	 * throttling engine costs the batch, never a storefront worker. Every
+	 * other call keeps the retry policy.
+	 *
 	 * @param array<int, array<string, mixed>> $events 1..100 browse-event objects.
 	 *
 	 * @return array<string, mixed> The decoded engine response (D6 shape).
@@ -313,7 +343,8 @@ class Client {
 	 */
 	public function ingest_browse( array $events ): array {
 		$url = $this->resolve_url( 'ingest_browse', self::PATH_INGEST_BROWSE );
-		return $this->request_url( 'POST', $url, array( 'events' => $events ) );
+
+		return $this->request_url( 'POST', $url, array( 'events' => $events ), true );
 	}
 
 	/**
@@ -451,6 +482,53 @@ class Client {
 		return $this->request_url( 'PUT', $url, array( 'configs' => $configs ) );
 	}
 
+	/**
+	 * The current recommendations of one logged-in shopper, for the store to
+	 * show (§15) — `{slots: [...]}`, up to `$limit` slots, possibly empty. The
+	 * shopper is named by the store's own customer id (the `external_id` sent
+	 * on customers ingest), never by an email. Read-only on the engine side.
+	 *
+	 * @return array<string, mixed>
+	 *
+	 * @throws ApiException On 4xx, an exhausted retry budget, or a network failure.
+	 */
+	public function customer_recommendations( string $customer_external_id, int $limit ): array {
+		$url = $this->resolve_url( 'recommendations_customer', self::PATH_RECOMMENDATIONS_CUSTOMER );
+		return $this->request_url(
+			'POST',
+			$url,
+			array(
+				'customer_external_id' => $customer_external_id,
+				'limit'                => $limit,
+			)
+		);
+	}
+
+	/**
+	 * The current recommendations of a returning guest, named by the
+	 * engine-issued visitor token (the `smaily_rec_uid` cookie) — the same
+	 * §15 route as customer_recommendations() (contract v1.10.0): the body
+	 * carries `smaily_visitor_token` IN PLACE OF `customer_external_id`. Never
+	 * send both — the engine then uses the customer id and ignores the token.
+	 * The answer and its empty-answer rules are the customer id's; an unknown,
+	 * expired or other-tenant token gets the same `{slots: []}`.
+	 *
+	 * @return array<string, mixed>
+	 *
+	 * @throws ApiException On 4xx, an exhausted retry budget, or a network failure.
+	 */
+	public function visitor_recommendations( string $visitor_token, int $limit ): array {
+		$url = $this->resolve_url( 'recommendations_customer', self::PATH_RECOMMENDATIONS_CUSTOMER );
+		return $this->request_url(
+			'POST',
+			$url,
+			array(
+				'smaily_visitor_token' => $visitor_token,
+				'limit'                => $limit,
+			)
+		);
+	}
+
 	// ---------------------------------------------------------------
 	// Private request engine.
 	// ---------------------------------------------------------------
@@ -514,22 +592,26 @@ class Client {
 	/**
 	 * Issue a request against a fully-resolved URL, with the retry policy.
 	 *
-	 * @param array<string, mixed>|null $body Request body for non-GET methods.
+	 * @param array<string, mixed>|null $body           Request body for non-GET methods.
+	 * @param bool                      $single_attempt One attempt bounded by BROWSE_TIMEOUT_SECONDS,
+	 *                                                  no redirect, no retry and no Retry-After wait
+	 *                                                  (ingest_browse(), PRO-3620).
 	 *
 	 * @return array<string, mixed>
 	 *
 	 * @throws ApiException
 	 */
-	protected function request_url( string $method, string $url, ?array $body = null ): array {
-		$attempts = 0;
-		$backoff  = 1;
+	protected function request_url( string $method, string $url, ?array $body = null, bool $single_attempt = false ): array {
+		$attempts     = 0;
+		$backoff      = 1;
+		$max_attempts = $single_attempt ? 1 : $this->max_attempts;
 
 		while ( true ) {
 			++$attempts;
 
 			$args = array(
 				'method'  => $method,
-				'timeout' => 15,
+				'timeout' => $single_attempt ? self::BROWSE_TIMEOUT_SECONDS : $this->timeout_seconds,
 				'headers' => array(
 					'Authorization' => 'Bearer ' . $this->api_key,
 					'User-Agent'    => sprintf(
@@ -542,10 +624,14 @@ class Client {
 				$args['headers']['Content-Type'] = 'application/json';
 				$args['body']                    = (string) wp_json_encode( $body );
 			}
+			if ( $single_attempt ) {
+				// Each redirect hop would get its own timeout.
+				$args['redirection'] = 0;
+			}
 
 			$response = wp_remote_request( $url, $args );
 			if ( is_wp_error( $response ) ) {
-				if ( $attempts >= $this->max_attempts ) {
+				if ( $attempts >= $max_attempts ) {
 					throw new ApiException(
 						0,
 						'network_error',
@@ -569,7 +655,7 @@ class Client {
 			}
 
 			$is_retryable = ( $status === 429 || ( $status >= 500 && $status < 600 ) );
-			if ( $is_retryable && $attempts < $this->max_attempts ) {
+			if ( $is_retryable && $attempts < $max_attempts ) {
 				$retry_after = (int) wp_remote_retrieve_header( $response, 'retry-after' );
 				$sleep_for   = $retry_after > 0 ? $retry_after : $backoff;
 				$this->sleep_with_backoff( $sleep_for );

@@ -43,7 +43,10 @@ use Smaily\Connect\Support\DebugLog;
  *     429) fails the row at once, anything else is retried with backoff
  *     until the attempt ceiling (PRO-1685);
  *   - mark_failed on TerminalDispatchException (payload decode failure,
- *     a non-101 Smaily body code on the fallback path — deterministic) and
+ *     a non-101 Smaily body code on the fallback path — deterministic —
+ *     and Smaily code 203 "invalid data" on either path, as
+ *     `permanent_envelope_203` — RetryPolicy::permanent_envelope(),
+ *     PRO-3750) and
  *     on any other Throwable (F3-53: a deterministic throw must never become
  *     an eternal retry loop; failed rows stay observable + manually
  *     retryable in the Event Log).
@@ -117,6 +120,10 @@ class CartFlusher {
 			try {
 				$payload = $this->decode_payload( (string) ( $event['payload'] ?? '' ) );
 				$this->dispatch( $payload );
+
+				// An HTTP 200 can still carry a refusal Smaily repeats for the
+				// same data (203 "invalid data") — fail it now (PRO-3750).
+				RetryPolicy::throw_if_permanent_envelope( $this->current_exchange );
 
 				$this->queue->mark_sent( $id );
 				++$stats['sent'];
@@ -199,9 +206,10 @@ class CartFlusher {
 		// The legacy Smaily API signals failure inside an HTTP 200 body
 		// (code 101 = success). A non-101 (e.g. a deleted autoresponder id)
 		// is deterministic — terminal, not an eternal retry (F3-53 class).
-		if ( isset( $response['code'] ) && (int) $response['code'] !== 101 ) {
+		if ( isset( $response['code'] ) && (int) $response['code'] !== Client::CODE_OK ) {
 			throw new TerminalDispatchException(
-				sprintf( 'smaily_response_code_%d', (int) $response['code'] )
+				RetryPolicy::permanent_envelope( $this->current_exchange )
+					?? sprintf( 'smaily_response_code_%d', (int) $response['code'] )
 			);
 		}
 	}

@@ -15,6 +15,7 @@ defined( 'ABSPATH' ) || exit;
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.PreparedSQLPlaceholders.UnquotedComplexPlaceholder, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Custom plugin tables: interpolated values are $wpdb->prepare()d (dynamic IN() lists build placeholder strings); object-cache is N/A for a write-through queue / cleanup / DDL path.
 
 use Smaily\Connect\Constants;
+use Smaily\Connect\Integrations\WooCommerce\StorefrontBeacon;
 use Smaily\Connect\Multilingual\DetectorFactory;
 use Smaily\Connect\Multilingual\PolylangAdapter;
 use Smaily\Connect\Multilingual\SiteLocaleAdapter;
@@ -58,6 +59,7 @@ use Smaily\Connect\Smaily\TransactionalPayloadBuilder;
  *     rss: { baseUrl, categories[], defaults{} } | null,
  *     docsUrl: string,
  *     orderStatuses: array<{slug, name}>,
+ *     consentApiPresent: bool,
  *   }
  *
  * The React bundle reads everything that's not in WizardState.env
@@ -85,6 +87,7 @@ class EnvDetector {
 	 *   }|null,
 	 *   docsUrl: string,
 	 *   orderStatuses: array<int, array{slug: string, name: string}>,
+	 *   consentApiPresent: bool,
 	 * }
 	 */
 	public function snapshot(): array {
@@ -104,6 +107,11 @@ class EnvDetector {
 			// PRO-1504 — registered WooCommerce order statuses (incl. custom
 			// ones), choices for the "counts as shipped" multi-select.
 			'orderStatuses'      => $this->order_statuses(),
+			// PRO-3673 — whether the WP Consent API is active, the same check
+			// NotificationManager's consent advisory makes: without it the
+			// browse tracker gets no consent signal and sends nothing, and the
+			// browse-tracking toggle says so.
+			'consentApiPresent'  => StorefrontBeacon::consent_api_present(),
 		);
 	}
 

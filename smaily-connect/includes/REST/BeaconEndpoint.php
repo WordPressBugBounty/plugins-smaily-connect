@@ -12,15 +12,19 @@ namespace Smaily\Connect\REST;
 defined( 'ABSPATH' ) || exit;
 
 use Smaily\Connect\Constants;
+use Smaily\Connect\Integrations\WooCommerce\LandingCapture;
 use Smaily\Connect\Privacy\ProfilingConsent;
 use Smaily\Connect\Settings\RecEngineSettings;
 use Smaily\Connect\Smaily\RecEngine\ApiException;
 use Smaily\Connect\Smaily\RecEngine\Client;
+use Smaily\Connect\Smaily\RecEngine\Support\AttributionShape;
+use Smaily\Connect\Support\MarketingConsent;
 use WP_REST_Request;
 use WP_REST_Response;
 
 /**
- * The ONE public, unauthenticated route in the plugin.
+ * One of the plugin's two public, unauthenticated routes (the other is
+ * RecommendationsEndpoint, PRO-3835).
  *
  * Why public: browse events come from anonymous storefront visitors, so the
  * route cannot be `manage_options`-gated like the rest of the rec-engine
@@ -47,25 +51,32 @@ use WP_REST_Response;
  *      bare 404 doing zero work — and is testable with a plain dispatch.)
  *   2. RATE LIMIT — per-IP AND per-session (the anon-session cookie). IP alone
  *      collapses behind NAT/mobile; the session counter complements it. Fixed
- *      60s windows via transients.
+ *      60s windows via transients. The per-IP counter is the bound a client
+ *      cannot lift by changing request headers (PRO-3620): it keys on the
+ *      connection's own address and always applies — see
+ *      RequestThrottle::client_ip().
  *   3. SERVER-SIDE VALIDATION — before forwarding: event_type must be one of
  *      the 9 §6 types, every event must carry an event_id, the batch is capped
  *      at 100, and each event is field-whitelisted to the §6 shape. Our own
  *      JS client never produces an invalid type or an id-less event, so a
  *      violation signals tampering ⇒ hard 400, nothing forwarded. The
  *      whitelist (EVENT_FIELDS) deliberately excludes `customer_email`
- *      (PRO-1486) and the two deprecated attribution hints `smaily_rec_id` /
+ *      (PRO-1486), `external_id` (PRO-3620), `smaily_visitor_token`
+ *      (PRO-3860) and the two deprecated attribution hints `smaily_rec_id` /
  *      `smaily_ctx` (PRO-1712) — a client-supplied value is spoofable
  *      (arbitrary attribution, or probing another contact's opt-out state by
- *      guessing emails); the only sanctioned source of an identity hint is the
- *      server-side attach_logged_in_identity() below. This strip is scoped to
+ *      guessing emails); the only sanctioned sources of an identity hint are
+ *      the server-side attach_visitor_token() and attach_logged_in_identity()
+ *      below. This strip is scoped to
  *      THIS browse-event POST handler — see EVENT_FIELDS's docblock for the
  *      caveat a future recommendations-GET proxy must not inherit it blindly.
  *
  * Browse does NOT use the IngestQueue/Flusher pattern (catalog/customers/orders
  * do): it is client-buffered, best-effort telemetry forwarded synchronously
- * (the Client's own layered retry covers transient engine blips). A lost batch
- * is acceptable; durable delivery is not warranted for telemetry.
+ * in ONE short attempt — no retry, no back-off or Retry-After wait
+ * (Client::ingest_browse(), PRO-3620) — so the engine never holds a
+ * storefront request. A lost batch is acceptable; durable delivery is not
+ * warranted for telemetry.
  *
  * The Client is injected via a closure (like RecEngineEndpoint) so integration
  * tests can stand up a mock engine without monkey-patching wp_remote_post.
@@ -143,6 +154,21 @@ class BeaconEndpoint {
 	 * rides the ORDER path (`smaily_rec_id` on §5, from the cookies
 	 * `LandingCapture` writes), never the browse event.
 	 *
+	 * PRO-3620: `external_id` is out too. On a browse event it is the platform
+	 * user id the engine binds the event to (§6 resolution order), so a
+	 * client-supplied value attaches anonymous browsing to any customer whose
+	 * sequential WP user id an attacker guesses — the same spoofing class as
+	 * `customer_email`. Our own JS client never sent it. Browse identity
+	 * reaches the engine only from server-side state: the visitor token
+	 * (attach_visitor_token()), attach_logged_in_identity() and the login
+	 * identity merge.
+	 *
+	 * PRO-3860: `smaily_visitor_token` is out as well. The server reads it from
+	 * the shopper's own visitor-token cookie (attach_visitor_token()), so the
+	 * store-created `vs_` token can be held to the shopper's marketing consent
+	 * (contract §5) on the server, and a request body cannot name a token that
+	 * is not the shopper's.
+	 *
 	 * @var array<int, string>
 	 */
 	private const EVENT_FIELDS = array(
@@ -155,8 +181,6 @@ class BeaconEndpoint {
 		'dwell_seconds',
 		'event_ts',
 		'source',
-		'smaily_visitor_token',
-		'external_id',
 	);
 
 	private RecEngineSettings $settings;
@@ -226,7 +250,7 @@ class BeaconEndpoint {
 
 		$session = $this->session_id();
 
-		if ( $this->rate_limited( $this->client_ip(), $session ) ) {
+		if ( $this->rate_limited( RequestThrottle::client_ip(), $session ) ) {
 			return new WP_REST_Response(
 				array(
 					'ok'    => false,
@@ -263,7 +287,7 @@ class BeaconEndpoint {
 		// identity, server-side) BEFORE the profiling gate below — attach_
 		// logged_in_identity() itself checks the same gate, so an opted-out
 		// contact never gets an email attached in the first place.
-		$identity = $this->attach_logged_in_identity( $validation['events'] );
+		$identity = $this->attach_logged_in_identity( $this->attach_visitor_token( $validation['events'] ) );
 
 		// SECOND GATE (a).1 — drop browse events carrying an OPTED-OUT contact's
 		// email before they leave the building. Anon events (no email) have no
@@ -321,6 +345,45 @@ class BeaconEndpoint {
 			),
 			200
 		);
+	}
+
+	/**
+	 * PRO-3860: put the shopper's visitor token on every event, read on the
+	 * server from the visitor-token cookie the same way LandingCapture reads it
+	 * (shape-checked), never from the request body. The engine's `vt_` token
+	 * from an email link is attribution and is attached as is (F3-46). A
+	 * store-created `vs_` token is consent-based (contract §5): it is attached
+	 * only with the shopper's marketing yes, checked here on the server too —
+	 * the browser sends browse events only with consent, but the server does
+	 * not rely on that.
+	 *
+	 * @param array<int, array<string, mixed>> $events
+	 *
+	 * @return array<int, array<string, mixed>>
+	 */
+	private function attach_visitor_token( array $events ): array {
+		$token = ( new LandingCapture( $this->settings ) )->current_visitor_token();
+		if ( '' === $token ) {
+			return $events;
+		}
+		if ( AttributionShape::is_store_visitor_token( $token ) && ! $this->marketing_consent_given() ) {
+			return $events;
+		}
+
+		foreach ( $events as $index => $event ) {
+			$event['smaily_visitor_token'] = $token;
+			$events[ $index ]              = $event;
+		}
+		return $events;
+	}
+
+	/**
+	 * Whether the shopper gave an explicit marketing yes. A seam so tests can
+	 * answer it: defining the WP Consent API functions in a test would leak
+	 * into every later test of the process.
+	 */
+	protected function marketing_consent_given(): bool {
+		return MarketingConsent::given();
 	}
 
 	/**
@@ -623,15 +686,18 @@ class BeaconEndpoint {
 	 * Fixed-window per-IP + per-session throttle via transients. Approximate
 	 * (transients aren't atomic) — fine for rate-limiting. Returns true when
 	 * EITHER counter is over its ceiling for the current window.
+	 *
+	 * The per-IP counter ALWAYS applies (PRO-3620). A request with no usable
+	 * address counts against one shared bucket instead of skipping the check —
+	 * otherwise only the session counter would remain, and its key is a cookie
+	 * the client chooses, so a fresh cookie per request would lift the limit.
 	 */
 	private function rate_limited( string $ip, string $session ): bool {
 		$over = false;
 
-		if ( $ip !== '' ) {
-			$max = (int) apply_filters( 'smaily_connect_beacon_rate_limit_ip', self::RL_MAX_PER_IP );
-			if ( $this->bump( 'smly_beacon_rl_ip_' . md5( $ip ), $max ) ) {
-				$over = true;
-			}
+		$max = (int) apply_filters( 'smaily_connect_beacon_rate_limit_ip', self::RL_MAX_PER_IP );
+		if ( $this->bump( 'smly_beacon_rl_ip_' . md5( $ip ), $max ) ) {
+			$over = true;
 		}
 
 		if ( $session !== '' ) {
@@ -648,23 +714,7 @@ class BeaconEndpoint {
 	 * Increment a window counter; return true once it exceeds $max.
 	 */
 	private function bump( string $key, int $max ): bool {
-		$count = (int) get_transient( $key );
-		++$count;
-		set_transient( $key, $count, self::RL_WINDOW_SECONDS );
-		return $count > $max;
-	}
-
-	/**
-	 * REMOTE_ADDR only — X-Forwarded-For is attacker-spoofable, so trusting it
-	 * would let one client masquerade as many IPs and defeat the throttle.
-	 */
-	private function client_ip(): string {
-		if ( ! isset( $_SERVER['REMOTE_ADDR'] ) ) {
-			return '';
-		}
-		$raw = sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) );
-		$ip  = filter_var( $raw, FILTER_VALIDATE_IP );
-		return is_string( $ip ) ? $ip : '';
+		return RequestThrottle::exceeded( $key, $max, self::RL_WINDOW_SECONDS );
 	}
 
 	/**

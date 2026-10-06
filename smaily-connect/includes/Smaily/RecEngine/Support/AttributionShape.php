@@ -34,11 +34,35 @@ final class AttributionShape {
 	/** Engine visitor-token format: `vt_` + alphanumerics (re: visitor-tokens/manager.ts). */
 	private const VISITOR_TOKEN_PATTERN = '/^vt_[A-Za-z0-9]{1,64}$/';
 
+	/** Store-created visitor-token format (contract v1.11.0 §5): `vs_` + exactly 22 alphanumerics. */
+	private const STORE_VISITOR_TOKEN_PATTERN = '/^vs_[A-Za-z0-9]{22}$/';
+
 	/** Intent slug (welcome / cart_abandoned / cross_sell / …), also the session-id bound. */
 	private const CONTEXT_PATTERN = '/^[A-Za-z0-9._-]{1,64}$/';
 
+	/**
+	 * An engine `vt_` token or a store-created `vs_` token (contract v1.11.0):
+	 * what the cookie read, the order meta and the send paths accept.
+	 */
 	public static function is_visitor_token( string $value ): bool {
+		return self::is_engine_visitor_token( $value )
+			|| self::is_store_visitor_token( $value );
+	}
+
+	/**
+	 * An engine-issued `vt_` token only: what a landing link may carry
+	 * (PRO-3857). An engine email link never carries a store-created token,
+	 * so a `vs_` value in a link is one somebody chose — accepting it would let
+	 * a link plant a token its sender knows, which the engine then binds to
+	 * the visitor at their next guest order.
+	 */
+	public static function is_engine_visitor_token( string $value ): bool {
 		return 1 === preg_match( self::VISITOR_TOKEN_PATTERN, $value );
+	}
+
+	/** A store-created `vs_` token (contract v1.11.0 §5). */
+	public static function is_store_visitor_token( string $value ): bool {
+		return 1 === preg_match( self::STORE_VISITOR_TOKEN_PATTERN, $value );
 	}
 
 	public static function is_context( string $value ): bool {

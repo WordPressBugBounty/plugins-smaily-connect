@@ -64,9 +64,9 @@ use Smaily\Connect\Support\DebugLog;
 class LandingCapture {
 
 	/** URL params the engine link carries (re: lib/sync/url-builder.ts). */
-	private const URL_PARAM_REC_ID  = 'smaily_rec';
+	public const URL_PARAM_REC_ID   = 'smaily_rec';
 	private const URL_PARAM_VISITOR = 'smaily_vt';
-	private const URL_PARAM_CONTEXT = 'smaily_ctx';
+	public const URL_PARAM_CONTEXT  = 'smaily_ctx';
 
 	/** The generic UTM the engine ALSO sets (utm_content = rec_id) + its source guard. */
 	private const UTM_CONTENT       = 'utm_content';
@@ -151,13 +151,65 @@ class LandingCapture {
 	}
 
 	/**
+	 * The visitor token this browser already carries in the visitor-token
+	 * cookie, or '' when it carries none in the engine's shape.
+	 */
+	public function current_visitor_token(): string {
+		$name = $this->cookie_name( $this->settings->config(), self::SLOT_VISITOR );
+		if ( ! isset( $_COOKIE[ $name ] ) || ! is_scalar( $_COOKIE[ $name ] ) ) {
+			return '';
+		}
+		$value = trim( sanitize_text_field( wp_unslash( (string) $_COOKIE[ $name ] ) ) );
+		return AttributionShape::is_visitor_token( $value ) ? $value : '';
+	}
+
+	/**
+	 * Create a new visitor token and write it to the visitor-token cookie, with
+	 * the same name, TTL and attributes as a landing capture (PRO-3845).
+	 *
+	 * The format is the contract's store-created token (v1.11.0 §5): `vs_` +
+	 * exactly 22 characters `[A-Za-z0-9]`, each from a cryptographically
+	 * secure random source (about 131 random bits).
+	 *
+	 * @return string The token, or '' when the response headers are already
+	 *                sent and the cookie could not be written.
+	 */
+	public function issue_visitor_token(): string {
+		if ( $this->headers_already_sent() ) {
+			DebugLog::write( '[smaily-connect landing-capture] visitor token not issued: headers already sent' );
+			return '';
+		}
+
+		$alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+		$token    = 'vs_';
+		for ( $i = 0; $i < 22; $i++ ) {
+			$token .= $alphabet[ random_int( 0, 61 ) ];
+		}
+		$config = $this->settings->config();
+		$this->set_cookie(
+			$this->cookie_name( $config, self::SLOT_VISITOR ),
+			$token,
+			$this->cookie_ttl_days( $config, self::SLOT_VISITOR )
+		);
+
+		return $token;
+	}
+
+	/**
 	 * Map a raw GET array to the attribution values worth persisting, keyed by
 	 * capture slot. Pure + side-effect-free so it can be unit-tested without
 	 * touching cookies/headers. An absent or malformed value is simply omitted
-	 * (last-touch overwrite only happens for values that are actually present).
+	 * (last-touch overwrite only happens for values that are actually present)
+	 * — with one exception, the context cookie rule (contract v1.9.0): a
+	 * landing that carries a valid `smaily_rec` but no valid `smaily_ctx`
+	 * resolves the context slot to '' (= clear the cookie), so the rec id and
+	 * the context always describe the same landing. Without it, an email click
+	 * after a storefront click would leave `storefront` standing and the
+	 * purchase would be credited to the store. The guarded `utm_content`
+	 * fallback carries no `smaily_rec`, so it never clears.
 	 *
 	 * @param array<string, mixed> $get Raw request query params.
-	 * @return array<string, string> slot => value.
+	 * @return array<string, string> slot => value ('' = delete that cookie).
 	 */
 	public function resolve( array $get ): array {
 		$out = array();
@@ -167,14 +219,18 @@ class LandingCapture {
 			$out[ self::SLOT_REC_ID ] = $rec_id;
 		}
 
+		// A link carries the engine's `vt_` token only, never a store-created
+		// `vs_` one (PRO-3857).
 		$visitor = $this->clean( $get, self::URL_PARAM_VISITOR );
-		if ( AttributionShape::is_visitor_token( $visitor ) ) {
+		if ( AttributionShape::is_engine_visitor_token( $visitor ) ) {
 			$out[ self::SLOT_VISITOR ] = $visitor;
 		}
 
 		$context = $this->clean( $get, self::URL_PARAM_CONTEXT );
 		if ( AttributionShape::is_context( $context ) ) {
 			$out[ self::SLOT_CONTEXT ] = $context;
+		} elseif ( RecId::is_valid( $this->clean( $get, self::URL_PARAM_REC_ID ) ) ) {
+			$out[ self::SLOT_CONTEXT ] = '';
 		}
 
 		return $out;
@@ -260,6 +316,12 @@ class LandingCapture {
 
 	private function set_cookie( string $name, string $value, int $ttl_days ): void {
 		if ( '' === $name ) {
+			return;
+		}
+		if ( '' === $value ) {
+			// An expiry in the past makes the browser delete the cookie.
+			$this->send_cookie( $name, '', time() - 86400 );
+			unset( $_COOKIE[ $name ] );
 			return;
 		}
 		$expires = time() + ( $ttl_days * 86400 );
