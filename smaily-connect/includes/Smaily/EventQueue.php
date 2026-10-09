@@ -11,6 +11,8 @@ namespace Smaily\Connect\Smaily;
 
 defined( 'ABSPATH' ) || exit;
 
+use Smaily\Connect\Privacy\AddressMatch;
+
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.PreparedSQLPlaceholders.UnquotedComplexPlaceholder, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Custom plugin tables: interpolated values are $wpdb->prepare()d (dynamic IN() lists build placeholder strings); object-cache is N/A for a write-through queue / cleanup / DDL path.
 
 /**
@@ -162,7 +164,8 @@ class EventQueue {
 	 * hammered every 60s nor hold a FIFO batch slot against fresher work
 	 * (PRO-1685). The flush hook calls this, processes the rows, and uses
 	 * mark_sent() / mark_failed() / record_attempt() to advance their state.
-	 * Selecting in created_at order keeps the queue FIFO so hooks like
+	 * Selecting in created_at order (the id breaks a same-second tie,
+	 * PRO-3897) keeps the queue FIFO so hooks like
 	 * contact.sync don't end up arbitrarily reordered relative to subsequent
 	 * automation.* events for the same user.
 	 *
@@ -207,7 +210,7 @@ class EventQueue {
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, event_type, entity_id, payload, created_at, attempts FROM {$table} WHERE {$where} ORDER BY created_at ASC LIMIT %d",
+				"SELECT id, event_type, entity_id, payload, created_at, attempts FROM {$table} WHERE {$where} ORDER BY created_at ASC, id ASC LIMIT %d",
 				...$args
 			),
 			ARRAY_A
@@ -444,27 +447,24 @@ class EventQueue {
 	 * for rows whose payload carries an `email` — rows enqueued before that
 	 * migration have none, and a transactional row never does (its recipient
 	 * is `to`). Those fall back to a payload text match on the two recipient
-	 * keys, case-insensitively via the column's collation — unindexable, and
-	 * that is why the checkout path refuses it (PRO-1723), but an erasure
-	 * request is an admin-triggered one-off where completeness beats speed.
+	 * keys — unindexable, and that is why the checkout path refuses it
+	 * (PRO-1723), but an erasure request is an admin-triggered one-off where
+	 * completeness beats speed. The text match is the shared
+	 * AddressMatch::json_string() (PRO-2448, PRO-3909) after `"email":` or
+	 * `"to":`, over the lowercased payload — both sides lowercased, the way
+	 * contact_key() normalises the address.
 	 *
 	 * @return array{0: string, 1: array<int, string>}|null
 	 */
 	private function privacy_request_where( string $email ): ?array {
-		global $wpdb;
-
-		$email = trim( $email );
-		if ( $email === '' ) {
+		$fallback = AddressMatch::json_string( 'LOWER( payload )', $email, array( '"email":', '"to":' ) );
+		if ( $fallback === null ) {
 			return null;
 		}
 
 		return array(
-			'( contact_key = %s OR ( contact_key IS NULL AND ( payload LIKE %s OR payload LIKE %s ) ) )',
-			array(
-				self::contact_key( $email ),
-				'%' . $wpdb->esc_like( '"email":"' . $email . '"' ) . '%',
-				'%' . $wpdb->esc_like( '"to":"' . $email . '"' ) . '%',
-			),
+			"( contact_key = %s OR ( contact_key IS NULL AND {$fallback[0]} ) )",
+			array_merge( array( self::contact_key( $email ) ), $fallback[1] ),
 		);
 	}
 

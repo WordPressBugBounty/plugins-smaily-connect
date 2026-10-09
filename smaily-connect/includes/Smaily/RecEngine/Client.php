@@ -30,7 +30,8 @@ defined( 'ABSPATH' ) || exit;
  * the real wp_remote_post body for each.
  *
  * Retry policy (RECENGINE_API_CONTRACT.md §6):
- *   - 429 + Retry-After header → respect the header, exponential
+ *   - 429 + Retry-After header → respect the header (waiting at most
+ *     MAX_RETRY_AFTER_SECONDS, PRO-3817), exponential
  *     backoff (1s, 2s, 4s, 8s, 16s), max 5 attempts.
  *   - 5xx (500/502/503/504) → same backoff, max 5 attempts.
  *   - 4xx (non-429) → no retry, throw ApiException with the body's
@@ -89,10 +90,14 @@ class Client {
 	// fallback is load-bearing for EVERY connection today, not just pre-exchange
 	// calls — the "Map age" note in §1 is exactly this case.
 	public const PATH_INGEST_CATALOG_REMOVE = '/api/v1/ingest/catalog/remove';
-	public const PATH_INGEST_CUSTOMERS      = '/api/v1/ingest/customers';
-	public const PATH_INGEST_ORDERS         = '/api/v1/ingest/orders';
-	public const PATH_INGEST_BROWSE         = '/api/v1/ingest/browse';
-	public const PATH_IDENTITY_MERGE        = '/api/v1/identity/merge';
+	// §3c nightly catalog manifest (contract v1.12.0). The map key is
+	// `ingest_catalog_manifest`; this fallback serves a connection whose stored
+	// exchange-time map predates it.
+	public const PATH_INGEST_CATALOG_MANIFEST = '/api/v1/ingest/catalog/manifest';
+	public const PATH_INGEST_CUSTOMERS        = '/api/v1/ingest/customers';
+	public const PATH_INGEST_ORDERS           = '/api/v1/ingest/orders';
+	public const PATH_INGEST_BROWSE           = '/api/v1/ingest/browse';
+	public const PATH_IDENTITY_MERGE          = '/api/v1/identity/merge';
 	// GDPR customer endpoints carry the email in the URL PATH. The engine's
 	// endpoints-map advertises these with a literal `{email}` placeholder (see
 	// the contract endpoints map), so the substitution convention is `{email}`,
@@ -128,6 +133,14 @@ class Client {
 
 	/** Default per-request HTTP timeout, in seconds. */
 	public const DEFAULT_TIMEOUT_SECONDS = 15;
+
+	/**
+	 * The longest wait, in seconds, on an engine Retry-After before the next
+	 * attempt (PRO-3817). A longer requested wait would hold the background
+	 * worker for as long as the engine asks; the Magento connector uses the
+	 * same cap.
+	 */
+	public const MAX_RETRY_AFTER_SECONDS = 60;
 
 	private string $api_key;
 	private string $base_url;
@@ -252,6 +265,27 @@ class Client {
 	public function catalog_remove( array $product_ids ): array {
 		$url = $this->resolve_url( 'ingest_catalog_remove', self::PATH_INGEST_CATALOG_REMOVE );
 		return $this->request_url( 'POST', $url, array( 'product_ids' => $product_ids ) );
+	}
+
+	/**
+	 * The store's complete product list — POST /api/v1/ingest/catalog/manifest
+	 * (contract v1.12.0 §3c). One request, 0–50,000 `{sku, in_stock}` items;
+	 * the engine tombstones every product missing from it, takes the list's
+	 * `in_stock` where it differs, and only counts skus it does not have. Its
+	 * guard removes nothing for an empty list or one that would remove more
+	 * than 20 % of the live catalog. Response: {ok, products_in_manifest,
+	 * removed, stock_fixed, missing_in_engine, guard_tripped, guard_reason,
+	 * would_remove}. One bad item is a 400 validation_failed for the whole list.
+	 *
+	 * @param array<int, array{sku: string, in_stock: bool}> $products
+	 *
+	 * @return array<string, mixed>
+	 *
+	 * @throws ApiException On 4xx (non-429) or unrecoverable network failure.
+	 */
+	public function catalog_manifest( array $products ): array {
+		$url = $this->resolve_url( 'ingest_catalog_manifest', self::PATH_INGEST_CATALOG_MANIFEST );
+		return $this->request_url( 'POST', $url, array( 'products' => $products ) );
 	}
 
 	/**
@@ -605,6 +639,8 @@ class Client {
 		$attempts     = 0;
 		$backoff      = 1;
 		$max_attempts = $single_attempt ? 1 : $this->max_attempts;
+		// Encoded once: every attempt sends the same bytes.
+		$json = $body !== null ? (string) wp_json_encode( $body ) : null;
 
 		while ( true ) {
 			++$attempts;
@@ -620,9 +656,9 @@ class Client {
 					),
 				),
 			);
-			if ( $body !== null ) {
+			if ( $json !== null ) {
 				$args['headers']['Content-Type'] = 'application/json';
-				$args['body']                    = (string) wp_json_encode( $body );
+				$args['body']                    = $json;
 			}
 			if ( $single_attempt ) {
 				// Each redirect hop would get its own timeout.
@@ -657,7 +693,7 @@ class Client {
 			$is_retryable = ( $status === 429 || ( $status >= 500 && $status < 600 ) );
 			if ( $is_retryable && $attempts < $max_attempts ) {
 				$retry_after = (int) wp_remote_retrieve_header( $response, 'retry-after' );
-				$sleep_for   = $retry_after > 0 ? $retry_after : $backoff;
+				$sleep_for   = $retry_after > 0 ? min( $retry_after, self::MAX_RETRY_AFTER_SECONDS ) : $backoff;
 				$this->sleep_with_backoff( $sleep_for );
 				$backoff *= 2;
 				continue;

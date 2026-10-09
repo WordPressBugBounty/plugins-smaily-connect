@@ -11,6 +11,7 @@ namespace Smaily\Connect\Smaily;
 
 defined( 'ABSPATH' ) || exit;
 
+use Smaily\Connect\Smaily\RecEngine\Backfill\AbstractBackfillJob;
 use Smaily\Connect\Support\ContactLanguageResolver;
 
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.PreparedSQLPlaceholders.UnquotedComplexPlaceholder, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Custom plugin tables: interpolated values are $wpdb->prepare()d (dynamic IN() lists build placeholder strings); object-cache is N/A for a write-through queue / cleanup / DDL path.
@@ -31,8 +32,21 @@ use Smaily\Connect\Support\ContactLanguageResolver;
  *   2. process_batch() handles up to $batch_size users, then either
  *      schedules the next iteration (when the cursor hasn't reached
  *      total_count) or marks status='completed'.
- *   3. Failures bump the row's error_message and leave status='failed'
- *      so the UI surfaces a "Retry" affordance.
+ *   3. A failed Smaily call — an HTTP error, or a refusing body code in an
+ *      HTTP 200 answer (RetryPolicy, PRO-3904) — records error_message,
+ *      leaves status='failed' and the cursor before the failing page, and
+ *      stops the tick chain, so the UI shows the failure. The merchant
+ *      retries with Start import — a new start() — which walks from the
+ *      first user again (PRO-3868). Any other error in a batch stops the
+ *      import the same way, with the error class and line as its reason
+ *      (PRO-3902).
+ *   4. A permanent refusing body code (TerminalDispatchException) skips
+ *      that contact instead (PRO-3988): it is recorded with its user id and
+ *      Smaily's reason in OPTION_REFUSED, not marked or counted as synced,
+ *      and the walk goes on. Each upsert carries one contact, so the answer
+ *      names the refused contact. A page where Smaily refuses every contact
+ *      it sends, two or more, is about the request, and stops the import as
+ *      in 3.
  *
  * The Smaily API call itself is delegated to a Client instance supplied
  * via constructor injection so tests don't need wp_remote_post mocks.
@@ -52,6 +66,17 @@ class BackfillJob implements BackfillJobInterface {
 
 	public const TABLE_SUFFIX = 'smly_plus_backfill_job';
 	public const META_KEY     = '_smaily_synced_at';
+
+	/**
+	 * The contacts Smaily refused for good in the current run (PRO-3988):
+	 * `{count: int, contacts: list<{user_id: int, reason: string}>}`, the list
+	 * capped at MAX_LISTED_REFUSALS. Cleared by start(). Autoload off; the
+	 * reason never holds an email address.
+	 */
+	public const OPTION_REFUSED = 'smly_plus_contact_import_refused';
+
+	/** How many refused contacts OPTION_REFUSED lists; `count` keeps the total. */
+	public const MAX_LISTED_REFUSALS = 20;
 
 	/**
 	 * Default freshness window — users synced within this many seconds are
@@ -97,6 +122,9 @@ class BackfillJob implements BackfillJobInterface {
 		$total  = (int) $counts['total_users'];
 
 		$table = $this->table_name();
+
+		// A new run lists only its own refused contacts (PRO-3988).
+		delete_option( self::OPTION_REFUSED );
 
 		// PRO-1715: with an empty audience the walk has nothing to POST, so the
 		// run is recorded as finished right here rather than as 'running' with
@@ -231,7 +259,9 @@ class BackfillJob implements BackfillJobInterface {
 	 * while a walk is already draining — restarting would reset its cursor — and
 	 * for one freshness window after the last completion, so each contact is
 	 * re-synced about once per window instead of re-walked every daily tick.
-	 * True when no walk has ever run.
+	 * True when no walk has ever run, after a failed walk, and for a `running`
+	 * walk that nothing drives any more (AbstractBackfillJob::is_stalled(),
+	 * PRO-3981) — re-sending is safe, Smaily updates a contact by email.
 	 */
 	public function should_start_refresh(): bool {
 		$state = $this->current_state();
@@ -241,7 +271,7 @@ class BackfillJob implements BackfillJobInterface {
 
 		$status = isset( $state['status'] ) ? (string) $state['status'] : '';
 		if ( $status === 'running' ) {
-			return false;
+			return AbstractBackfillJob::is_stalled( self::BACKFILL_TYPE, $state );
 		}
 
 		if ( $status === 'completed' && ! empty( $state['completed_at'] ) ) {
@@ -255,7 +285,7 @@ class BackfillJob implements BackfillJobInterface {
 	}
 
 	/**
-	 * @return array<string, mixed>|null Backfill state row (status + completed_at), or null.
+	 * @return array<string, mixed>|null Backfill state row (status, started_at, completed_at), or null.
 	 */
 	private function current_state(): ?array {
 		global $wpdb;
@@ -268,7 +298,7 @@ class BackfillJob implements BackfillJobInterface {
 		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
 		$row = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT status, completed_at FROM {$table} WHERE job_type = %s AND target = %s",
+				"SELECT status, started_at, completed_at FROM {$table} WHERE job_type = %s AND target = %s",
 				self::BACKFILL_TYPE,
 				self::BACKFILL_TARGET
 			),
@@ -298,7 +328,7 @@ class BackfillJob implements BackfillJobInterface {
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared
 		$state = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT id, cursor_value, processed_count, synced_count, total_count FROM {$table} WHERE job_type = %s AND target = %s",
+				"SELECT id, status, cursor_value, processed_count, synced_count, total_count FROM {$table} WHERE job_type = %s AND target = %s",
 				self::BACKFILL_TYPE,
 				self::BACKFILL_TARGET
 			),
@@ -316,6 +346,56 @@ class BackfillJob implements BackfillJobInterface {
 			);
 		}
 
+		// The merchant cancelled the import after Action Scheduler had already
+		// claimed this tick (PRO-3821), or an earlier batch failed (PRO-3868):
+		// send nothing, leave the row as it is, and stop the tick chain. Only
+		// a new start() takes the import out of either state.
+		$status = isset( $state['status'] ) ? (string) $state['status'] : '';
+		if ( $status === self::STATUS_CANCELLED || $status === self::STATUS_FAILED ) {
+			\Smaily\Connect\Support\DebugLog::write( sprintf( '[smaily-connect backfill.batch] import is %s — tick sends nothing', $status ) );
+			return array(
+				'processed' => 0,
+				'remaining' => max( 0, (int) $state['total_count'] - (int) $state['processed_count'] ),
+				'completed' => true,
+			);
+		}
+
+		try {
+			return $this->walk_batch( $state, $status, $batch_size );
+		} catch ( \Throwable $e ) {
+			// Anything but a Smaily answer (walk_batch handles those): a
+			// database error, a transport that throws. Left to escape, it ends
+			// the tick before the next one is scheduled and the row stays
+			// `running` forever (PRO-3902, as PRO-3890 for the Campaign
+			// Intelligence imports). Stop the import instead — only while it
+			// is still running, so a cancel stays a cancel (PRO-3821). The
+			// reason is the error class and where it was thrown, never the
+			// message: a message can carry a customer's email. Start import
+			// runs it again.
+			$this->record_error(
+				(int) $state['id'],
+				sprintf( '%s at %s:%d', get_class( $e ), basename( $e->getFile() ), $e->getLine() ),
+				self::STATUS_RUNNING
+			);
+			return array(
+				'processed' => 0,
+				'remaining' => max( 0, (int) $state['total_count'] - (int) $state['processed_count'] ),
+				'completed' => true,
+			);
+		}
+	}
+
+	/**
+	 * Sync the next page of users, then write the progress.
+	 *
+	 * @param array<string, mixed> $state  The job row this batch read.
+	 * @param string               $status The status this batch read.
+	 * @return array{processed: int, remaining: int, completed: bool}
+	 */
+	private function walk_batch( array $state, string $status, int $batch_size ): array {
+		global $wpdb;
+
+		$table    = $this->table_name();
 		$after    = isset( $state['cursor_value'] ) ? (int) $state['cursor_value'] : 0;
 		$user_ids = $this->fetch_user_ids_after( $after, $batch_size );
 		$users    = $this->hydrate_users( $user_ids );
@@ -335,6 +415,8 @@ class BackfillJob implements BackfillJobInterface {
 
 		$fresh_skips    = 0;
 		$audience_skips = 0;
+		$refused        = array();
+		$last_refusal   = '';
 		foreach ( $users as $user ) {
 			// F3-48: only sync the mode's audience (consent → opted-in only;
 			// legitimate interest → all; checkout-only → none). Walked-past but
@@ -352,8 +434,31 @@ class BackfillJob implements BackfillJobInterface {
 			$payload = $this->build_subscriber_payload( $user );
 			try {
 				$this->client->upsert_subscribers( array( $payload ) );
+				// An HTTP 200 can still carry a refusal in Smaily's body code:
+				// it throws like the queued sends (PRO-3862), so the contact
+				// is not counted as synced (PRO-3904). A permanent code skips
+				// the contact (PRO-3988); 225 stops the import.
+				RetryPolicy::throw_if_refused_envelope( $this->client->last_exchange() );
 				update_user_meta( (int) $user->ID, self::META_KEY, time() );
 				++$synced;
+			} catch ( TerminalDispatchException $e ) {
+				// Smaily refused this contact for good (PRO-3988): skip it and
+				// go on, so one contact cannot stop every later one in every
+				// run. Whether the refusal is about the request instead is
+				// decided once the page is done, below. The reason is stored
+				// without the address.
+				\Smaily\Connect\Support\DebugLog::write(
+					sprintf(
+						'[smaily-connect backfill.batch] user_id=%d refused: %s',
+						(int) $user->ID,
+						$e->getMessage()
+					)
+				);
+				$last_refusal = $e->getMessage();
+				$refused[]    = array(
+					'user_id' => (int) $user->ID,
+					'reason'  => (string) preg_replace( '/[^\s@]+@[^\s@]+/', '[email]', $e->getMessage() ),
+				);
 			} catch ( ApiException $e ) {
 				\Smaily\Connect\Support\DebugLog::write(
 					sprintf(
@@ -362,10 +467,34 @@ class BackfillJob implements BackfillJobInterface {
 						$e->getMessage()
 					)
 				);
-				$this->record_error( (int) $state['id'], $e->getMessage() );
-				break;
+				// Stop here and leave the row failed, its cursor before this
+				// page: the progress write below would overwrite the failure
+				// with running/completed and move the cursor past the users
+				// of this page that were never sent (PRO-3868). Retry is a
+				// new start(), which walks from the first user again.
+				$this->record_error( (int) $state['id'], $e->getMessage(), $status );
+				return array(
+					'processed' => $synced,
+					'remaining' => max( 0, (int) $state['total_count'] - (int) $state['processed_count'] ),
+					'completed' => true,
+				);
 			}
 		}
+
+		// Smaily refused every contact this page sent, and more than one: the
+		// refusal is about the request, not about a contact, so the import
+		// stops failed as for any other Smaily error (PRO-3988). A single
+		// refused contact on a page is that contact's — on the daily refresh
+		// it is often the only one a page sends.
+		if ( count( $refused ) > 1 && $synced === 0 ) {
+			$this->record_error( (int) $state['id'], $last_refusal, $status );
+			return array(
+				'processed' => 0,
+				'remaining' => max( 0, (int) $state['total_count'] - (int) $state['processed_count'] ),
+				'completed' => true,
+			);
+		}
+		$this->record_refusals( $refused );
 
 		\Smaily\Connect\Support\DebugLog::write(
 			sprintf(
@@ -397,9 +526,15 @@ class BackfillJob implements BackfillJobInterface {
 				'status'          => $completed ? 'completed' : 'running',
 				'completed_at'    => $completed ? current_time( 'mysql', true ) : null,
 			),
-			array( 'id' => (int) $state['id'] ),
+			// Written only while the status is still the one this batch read:
+			// a cancel that lands while the batch sends stays a cancel
+			// (PRO-3821).
+			array(
+				'id'     => (int) $state['id'],
+				'status' => $status,
+			),
 			array( '%d', '%d', '%s', '%s', '%s' ),
-			array( '%d' )
+			array( '%d', '%s' )
 		);
 
 		return array(
@@ -508,7 +643,36 @@ class BackfillJob implements BackfillJobInterface {
 		return $this->audience;
 	}
 
-	private function record_error( int $job_id, string $message ): void {
+	/**
+	 * Add this page's refused contacts to the run's list (PRO-3988).
+	 *
+	 * @param array<int, array{user_id: int, reason: string}> $refused
+	 */
+	private function record_refusals( array $refused ): void {
+		if ( $refused === array() ) {
+			return;
+		}
+
+		$stored   = get_option( self::OPTION_REFUSED );
+		$count    = is_array( $stored ) ? (int) ( $stored['count'] ?? 0 ) : 0;
+		$contacts = is_array( $stored ) && is_array( $stored['contacts'] ?? null ) ? $stored['contacts'] : array();
+
+		update_option(
+			self::OPTION_REFUSED,
+			array(
+				'count'    => $count + count( $refused ),
+				'contacts' => array_slice( array_merge( $contacts, $refused ), 0, self::MAX_LISTED_REFUSALS ),
+			),
+			false
+		);
+	}
+
+	/**
+	 * @param string $expected_status The status the row must still have; a row
+	 *                                a cancel changed meanwhile is left alone
+	 *                                (PRO-3821).
+	 */
+	private function record_error( int $job_id, string $message, string $expected_status ): void {
 		global $wpdb;
 		$wpdb->update(
 			$this->table_name(),
@@ -516,9 +680,12 @@ class BackfillJob implements BackfillJobInterface {
 				'status'        => 'failed',
 				'error_message' => $message,
 			),
-			array( 'id' => $job_id ),
+			array(
+				'id'     => $job_id,
+				'status' => $expected_status,
+			),
 			array( '%s', '%s' ),
-			array( '%d' )
+			array( '%d', '%s' )
 		);
 	}
 

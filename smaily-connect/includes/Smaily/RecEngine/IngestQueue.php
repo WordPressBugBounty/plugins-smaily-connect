@@ -11,6 +11,8 @@ namespace Smaily\Connect\Smaily\RecEngine;
 
 defined( 'ABSPATH' ) || exit;
 
+use Smaily\Connect\Privacy\AddressMatch;
+
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.PreparedSQLPlaceholders.UnquotedComplexPlaceholder, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Custom plugin tables: interpolated values are $wpdb->prepare()d (dynamic IN() lists build placeholder strings); object-cache is N/A for a write-through queue / cleanup / DDL path.
 
 /**
@@ -58,6 +60,9 @@ class IngestQueue {
 
 	/** Mirrors the smly_rec_event_queue.max_attempts column default. */
 	public const DEFAULT_MAX_ATTEMPTS = 5;
+
+	/** Cap (chars) on each stored exchange field so the queue stays bounded (F3-44). */
+	public const EXCHANGE_MAX = 10000;
 
 	/**
 	 * Persist an ingest event and ensure a flush is scheduled.
@@ -133,8 +138,11 @@ class IngestQueue {
 	 * "Due" = status pending AND (never retried OR next_retry_at has
 	 * passed). Ordering by created_at keeps the queue FIFO so a product's
 	 * catalog.delete can't overtake an earlier catalog.upsert for the same
-	 * SKU. The flush job processes the batch and advances each row with
-	 * mark_sent() / record_attempt() / mark_failed().
+	 * SKU. created_at is stored to the second, so the id breaks a tie: two
+	 * rows for one product made in the same second still go out in the
+	 * order they were created (PRO-3897). The flush job processes the batch
+	 * and advances each row with mark_sent() / record_attempt() /
+	 * mark_failed().
 	 *
 	 * The queue is shared across ingest endpoints (catalog, customers,
 	 * orders — see the class doc). $event_types scopes a drain to one
@@ -179,7 +187,7 @@ class IngestQueue {
 				"SELECT id, event_type, entity_id, event_uuid, payload, created_at, attempts, max_attempts
 					FROM {$table}
 					WHERE status = %s AND ( next_retry_at IS NULL OR next_retry_at <= %s ){$type_clause}
-					ORDER BY created_at ASC
+					ORDER BY created_at ASC, id ASC
 					LIMIT %d",
 				...$args
 			),
@@ -190,6 +198,31 @@ class IngestQueue {
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
 
 		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * Whether any row of these event types still waits to be sent — due now
+	 * or parked for a later retry (pending() leaves the parked ones out).
+	 *
+	 * @param array<int, string> $event_types
+	 */
+	public function has_pending( array $event_types ): bool {
+		global $wpdb;
+
+		$table        = $this->table_name();
+		$placeholders = implode( ', ', array_fill( 0, count( $event_types ), '%s' ) );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+		$found = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$table} WHERE status = %s AND event_type IN ( {$placeholders} ) LIMIT 1",
+				self::STATUS_PENDING,
+				...array_values( $event_types )
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+
+		return $found !== null;
 	}
 
 	public function mark_sent( int $id ): void {
@@ -271,6 +304,32 @@ class IngestQueue {
 		);
 	}
 
+	/** Cap a stored exchange field at EXCHANGE_MAX chars, flagging the truncation. */
+	public static function cap_exchange( string $text ): string {
+		return strlen( $text ) <= self::EXCHANGE_MAX
+			? $text
+			: substr( $text, 0, self::EXCHANGE_MAX ) . '…[truncated]';
+	}
+
+	/** The row's last_error for an engine call that threw. */
+	public static function http_error_message( ApiException $e ): string {
+		return sprintf( 'http_%d %s', $e->getCode(), $e->error_code() );
+	}
+
+	/** The row's capped `last_response` for an engine call that threw. */
+	public static function http_error_response( ApiException $e ): string {
+		return self::cap_exchange(
+			(string) wp_json_encode(
+				array(
+					'http'       => $e->getCode(),
+					'outcome'    => 'http_error',
+					'error_code' => $e->error_code(),
+					'message'    => $e->getMessage(),
+				)
+			)
+		);
+	}
+
 	/**
 	 * Revive terminally-`failed` rows back to `pending` so the recurring flushers
 	 * re-attempt them (3.10.1, the recovery half of the Event Log). Resets the
@@ -310,6 +369,71 @@ class IngestQueue {
 
 		return (int) $wpdb->query( $sql );
 		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	}
+
+	/**
+	 * Delete every row whose stored send-time copy carries this address
+	 * (Art 17, PRO-2384). Returns the number of rows deleted.
+	 *
+	 * Rows enqueue an empty payload, so the address lives only in
+	 * `sent_payload` (F3-44): a customer update's `email`, an order's
+	 * `customer_email` plus its customer fields. `last_response` is the reply
+	 * to that same copy, so deleting the row takes it too. The table has no
+	 * contact key (Erkki, 2026-10-06: no schema change), so the match is on the
+	 * text — the shared AddressMatch::json_string() (PRO-2448, PRO-3909): the
+	 * address as a whole JSON string, compared binary. The stored copy is
+	 * matched as written; the payload builders lowercase the address.
+	 */
+	public function delete_for_privacy_request( string $email ): int {
+		global $wpdb;
+
+		$where = AddressMatch::json_string( 'sent_payload', $email );
+		if ( $where === null ) {
+			return 0;
+		}
+
+		$table = $this->table_name();
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+		return (int) $wpdb->query( $wpdb->prepare( "DELETE FROM {$table} WHERE {$where[0]}", $where[1] ) );
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+	}
+
+	/**
+	 * Delete the rows of one event type for these entities that can still be
+	 * sent (Art 17, PRO-3906). Returns the number of rows deleted.
+	 *
+	 * "Can still be sent" is `pending` — due now, or parked for a retry
+	 * (`next_retry_at`) — and `failed`, which the Event Log's Retry revives
+	 * (reset_failed()). A `sent` row is never sent again. Customer and order
+	 * rows carry no data of their own: the flusher builds them from the
+	 * current user or order at send time, so a row left behind would send the
+	 * erased customer to the engine again. The ids go out in chunks so one
+	 * statement stays bounded for a customer with many orders.
+	 *
+	 * @param array<int, int|string> $entity_ids
+	 */
+	public function delete_unsent( string $event_type, array $entity_ids ): int {
+		global $wpdb;
+
+		$entity_ids = array_values( array_unique( array_map( 'strval', $entity_ids ) ) );
+		$table      = $this->table_name();
+		$deleted    = 0;
+
+		foreach ( array_chunk( $entity_ids, 500 ) as $chunk ) {
+			$placeholders = implode( ', ', array_fill( 0, count( $chunk ), '%s' ) );
+
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
+			$deleted += (int) $wpdb->query(
+				$wpdb->prepare(
+					"DELETE FROM {$table} WHERE status IN ( %s, %s ) AND event_type = %s AND entity_id IN ( {$placeholders} )",
+					array_merge( array( self::STATUS_PENDING, self::STATUS_FAILED, $event_type ), $chunk )
+				)
+			);
+			// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
+		}
+
+		return $deleted;
 	}
 
 	/**

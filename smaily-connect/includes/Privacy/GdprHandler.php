@@ -11,13 +11,19 @@ namespace Smaily\Connect\Privacy;
 
 defined( 'ABSPATH' ) || exit;
 
+use Automattic\WooCommerce\Utilities\OrderUtil;
 use Smaily\Connect\Integrations\WooCommerce\HookHandler;
 use Smaily\Connect\Integrations\WooCommerce\IdentityHookHandler;
 use Smaily\Connect\Settings\RecEngineSettings;
+use Smaily\Connect\Smaily\BackfillJob;
 use Smaily\Connect\Smaily\CartSessionStore;
 use Smaily\Connect\Smaily\EventQueue;
 use Smaily\Connect\Smaily\RecEngine\ApiException;
+use Smaily\Connect\Smaily\RecEngine\Backfill\OrderBackfillJob;
 use Smaily\Connect\Smaily\RecEngine\Client;
+use Smaily\Connect\Smaily\RecEngine\CustomerFlusher;
+use Smaily\Connect\Smaily\RecEngine\IngestQueue;
+use Smaily\Connect\Smaily\RecEngine\OrderFlusher;
 
 /**
  * Registers a WP Privacy API exporter (Art 15) + eraser (Art 17) so the rec
@@ -43,7 +49,21 @@ use Smaily\Connect\Smaily\RecEngine\Client;
  *     other local store that holds a contact's address, inside the queued
  *     payload and the F3-44 send-time exchange. Export lists what was queued
  *     and when; erase deletes what could still send and redacts what already
- *     did (EventQueue::erase_for_privacy_request()).
+ *     did (EventQueue::erase_for_privacy_request()) — once in our eraser
+ *     and once more after every eraser has run, so a contact update
+ *     queued after ours is removed too (PRO-3995). The contact in the
+ *     merchant's Smaily account is not removed; the eraser's result
+ *     tells the admin to remove it there if needed.
+ *   - And the Campaign Intelligence ingest queue (`smly_rec_event_queue`,
+ *     PRO-2384) — its F3-44 copy of a sent customer or order carries the
+ *     address and the customer fields. Erase deletes every row whose copy
+ *     carries the address (IngestQueue::delete_for_privacy_request()),
+ *     independent of the engine connection. It also deletes the customer's
+ *     customer and order updates still waiting to be sent, so none of them
+ *     sends the customer to the engine again (PRO-3906) — once in our eraser,
+ *     before the engine call, and once more after every eraser has run,
+ *     because WooCommerce's customer eraser saves the profile after ours and
+ *     that save queues a new customer update (PRO-3986).
  *   - And the block-checkout newsletter consent marker
  *     (`_smaily_newsletter_optin` order meta, PRO-3406/PRO-3426) — exported as
  *     the consent given on that order, removed on erasure. The Smaily contact
@@ -56,6 +76,12 @@ class GdprHandler {
 	private const GROUP_ID    = 'smaily-connect-rec-engine';
 	private const ERASER_ID   = 'smaily-connect-rec-engine';
 	private const EXPORTER_ID = 'smaily-connect-rec-engine';
+
+	/**
+	 * Orders the exporter and eraser handle per page — what WooCommerce's
+	 * own order eraser takes (PRO-3997).
+	 */
+	public const ORDERS_PER_PAGE = 10;
 
 	/** The plugin's rec-specific order meta (read off an order, never the order itself). */
 	private const ORDER_META_KEYS = array(
@@ -95,6 +121,7 @@ class GdprHandler {
 	private RecEngineSettings $settings;
 	private CartSessionStore $cart_store;
 	private EventQueue $event_queue;
+	private IngestQueue $ingest_queue;
 
 	/** @var callable(): Client */
 	private $client_factory;
@@ -102,16 +129,41 @@ class GdprHandler {
 	/**
 	 * @param callable(): Client $client_factory
 	 */
-	public function __construct( RecEngineSettings $settings, callable $client_factory, CartSessionStore $cart_store, EventQueue $event_queue ) {
+	public function __construct( RecEngineSettings $settings, callable $client_factory, CartSessionStore $cart_store, EventQueue $event_queue, IngestQueue $ingest_queue ) {
 		$this->settings       = $settings;
 		$this->client_factory = $client_factory;
 		$this->cart_store     = $cart_store;
 		$this->event_queue    = $event_queue;
+		$this->ingest_queue   = $ingest_queue;
 	}
 
 	public function register(): void {
 		add_filter( 'wp_privacy_personal_data_exporters', array( $this, 'register_exporter' ) );
 		add_filter( 'wp_privacy_personal_data_erasers', array( $this, 'register_eraser' ) );
+		add_action( 'wp_privacy_personal_data_erased', array( $this, 'after_erasure' ) );
+	}
+
+	/**
+	 * `wp_privacy_personal_data_erased` — WordPress fires it once every eraser
+	 * of the request has finished. WooCommerce's customer eraser runs after
+	 * ours and saves the profile; the save fires `profile_update`, which
+	 * queues a new customer update (CustomerHookHandler). Dropping the
+	 * waiting updates again here keeps that row, or one any other eraser
+	 * queued, from sending the erased customer to the engine (PRO-3986).
+	 * The same goes for a Smaily contact update still waiting in the Smaily
+	 * queue (PRO-3995); HookHandler already skips the one WooCommerce's
+	 * profile save would queue.
+	 *
+	 * @param int|string $request_id The erasure request's post id.
+	 */
+	public function after_erasure( $request_id ): void {
+		$request = wp_get_user_request( (int) $request_id );
+		if ( ! $request instanceof \WP_User_Request || $request->action_name !== 'remove_personal_data' ) {
+			return;
+		}
+
+		$this->drop_waiting_updates( $request->email, $this->order_ids_for( $request->email ) );
+		$this->event_queue->erase_for_privacy_request( $request->email );
 	}
 
 	/**
@@ -141,35 +193,81 @@ class GdprHandler {
 	}
 
 	/**
-	 * Art 15 exporter callback.
+	 * Art 15 exporter callback. WordPress calls it page by page, from page 1,
+	 * until it answers `done` (PRO-3997): every page exports the next
+	 * ORDERS_PER_PAGE orders, and page 1 also exports everything that is not
+	 * about one order — the engine record (one engine call), the identity
+	 * marker, the cart sessions and the Smaily queue rows.
 	 *
 	 * @return array{data: array<int, array<string, mixed>>, done: bool}
 	 */
 	public function export( string $email, int $page = 1 ): array {
-		$items = array_merge(
-			$this->engine_export_items( $email ),
-			$this->plugin_meta_export_items( $email ),
-			$this->cart_session_export_items( $email ),
-			$this->event_queue_export_items( $email )
-		);
+		$page      = max( 1, $page );
+		$order_ids = $this->order_ids_for( $email );
+		$items     = $this->order_export_items( $this->orders_on_page( $order_ids, $page ) );
+
+		if ( $page === 1 ) {
+			$items = array_merge(
+				$this->engine_export_items( $email ),
+				$items,
+				$this->identity_marker_export_items( $email ),
+				$this->cart_session_export_items( $email ),
+				$this->event_queue_export_items( $email )
+			);
+		}
 
 		return array(
 			'data' => $items,
-			'done' => true, // Single page — pilot volumes are modest (paginate later if needed).
+			'done' => self::is_last_page( $order_ids, $page ),
 		);
 	}
 
 	/**
-	 * Art 17 eraser callback.
+	 * Art 17 eraser callback. WordPress calls it page by page, from page 1,
+	 * until it answers `done` (PRO-3997). Every page removes the markers of
+	 * the next ORDERS_PER_PAGE orders. Page 1 also does, once, everything
+	 * that is not about one order: it drops the waiting updates of the WP
+	 * user and of EVERY order billed to the address (ids only, nothing
+	 * loaded) before the engine call, so no order on a later page sends the
+	 * customer to the engine again after it (PRO-3906); then the engine
+	 * call, the identity marker, the cart sessions, both queues, the refused
+	 * list and the messages.
 	 *
 	 * @return array{items_removed: bool, items_retained: bool, messages: array<int, string>, done: bool}
 	 */
 	public function erase( string $email, int $page = 1 ): array {
-		$removed = $this->erase_engine( $email );
-		if ( $this->erase_plugin_meta( $email ) ) {
+		$page      = max( 1, $page );
+		$order_ids = $this->order_ids_for( $email );
+		$orders    = $this->orders_on_page( $order_ids, $page );
+
+		if ( $page > 1 ) {
+			return array(
+				'items_removed'  => $this->erase_order_meta( $orders ),
+				'items_retained' => false,
+				'messages'       => array(),
+				'done'           => self::is_last_page( $order_ids, $page ),
+			);
+		}
+
+		// Before the engine call, so no update still waiting in the queue
+		// sends the customer to the engine again after it (PRO-3906).
+		$removed = $this->drop_waiting_updates( $email, $order_ids );
+		if ( $this->erase_engine( $email ) ) {
+			$removed = true;
+		}
+		if ( $this->erase_order_meta( $orders ) ) {
+			$removed = true;
+		}
+		if ( $this->erase_identity_marker( $email ) ) {
 			$removed = true;
 		}
 		if ( $this->erase_cart_sessions( $email ) ) {
+			$removed = true;
+		}
+		if ( $this->ingest_queue->delete_for_privacy_request( $email ) > 0 ) {
+			$removed = true;
+		}
+		if ( $this->erase_refused_contact( $email ) ) {
 			$removed = true;
 		}
 
@@ -177,12 +275,15 @@ class GdprHandler {
 		$messages = $this->event_queue_messages( $queue );
 		$removed  = $removed || $messages !== array();
 
+		// The plugin has no call that deletes a Smaily contact (PRO-3995).
+		$messages[] = __( 'This request does not remove the contact from your Smaily account. Remove it in Smaily too if needed.', 'smaily-connect' );
+
 		return array(
 			'items_removed'  => $removed,
 			// Nothing personal is kept back: the rows that stay are anonymised.
 			'items_retained' => false,
 			'messages'       => $messages,
-			'done'           => true,
+			'done'           => self::is_last_page( $order_ids, $page ),
 		);
 	}
 
@@ -240,12 +341,14 @@ class GdprHandler {
 	}
 
 	/**
+	 * @param \WC_Order[] $orders One page of the orders billed to the address.
+	 *
 	 * @return array<int, array<string, mixed>>
 	 */
-	private function plugin_meta_export_items( string $email ): array {
+	private function order_export_items( array $orders ): array {
 		$items = array();
 
-		foreach ( $this->orders_for( $email ) as $order ) {
+		foreach ( $orders as $order ) {
 			$pairs = array();
 			foreach ( self::ORDER_META_KEYS as $key ) {
 				// $order->get_meta is storage-agnostic (HPOS-safe); get_post_meta
@@ -273,7 +376,16 @@ class GdprHandler {
 			}
 		}
 
-		$user = get_user_by( 'email', $email );
+		return $items;
+	}
+
+	/**
+	 * @return array<int, array<string, mixed>>
+	 */
+	private function identity_marker_export_items( string $email ): array {
+		$items = array();
+
+		$user = $this->user_for( $email );
 		if ( $user instanceof \WP_User ) {
 			$merged = (string) get_user_meta( $user->ID, IdentityHookHandler::MERGED_META_KEY, true );
 			if ( $merged !== '' ) {
@@ -356,13 +468,39 @@ class GdprHandler {
 		}
 	}
 
-	private function erase_plugin_meta( string $email ): bool {
+	/**
+	 * Delete the customer's customer and order updates that are still waiting
+	 * in the Campaign Intelligence queue (PRO-3906): the WP user with this
+	 * address, and the orders billed to it. A row not yet attempted holds no
+	 * copy, so IngestQueue::delete_for_privacy_request() cannot see it.
+	 *
+	 * @param int[] $order_ids The ids of every order billed to the address.
+	 */
+	private function drop_waiting_updates( string $email, array $order_ids ): bool {
+		$deleted = 0;
+
+		$user_id = $this->user_id_for( $email );
+		if ( $user_id > 0 ) {
+			$deleted += $this->ingest_queue->delete_unsent( CustomerFlusher::EVENT_CUSTOMER_UPSERT, array( $user_id ) );
+		}
+
+		if ( $order_ids !== array() ) {
+			$deleted += $this->ingest_queue->delete_unsent( OrderFlusher::EVENT_ORDER_UPSERT, $order_ids );
+		}
+
+		return $deleted > 0;
+	}
+
+	/**
+	 * @param \WC_Order[] $orders One page of the orders billed to the address.
+	 */
+	private function erase_order_meta( array $orders ): bool {
 		$removed = false;
 
 		// The rec markers plus the newsletter consent marker (PRO-3426).
 		$order_keys = array_merge( self::ORDER_META_KEYS, array( HookHandler::ORDER_META_NEWSLETTER_OPTIN ) );
 
-		foreach ( $this->orders_for( $email ) as $order ) {
+		foreach ( $orders as $order ) {
 			$dirty = false;
 			foreach ( $order_keys as $key ) {
 				if ( (string) $order->get_meta( $key ) !== '' ) {
@@ -376,13 +514,53 @@ class GdprHandler {
 			}
 		}
 
-		$user = get_user_by( 'email', $email );
+		return $removed;
+	}
+
+	private function erase_identity_marker( string $email ): bool {
+		$removed = false;
+
+		$user = $this->user_for( $email );
 		if ( $user instanceof \WP_User && (string) get_user_meta( $user->ID, IdentityHookHandler::MERGED_META_KEY, true ) !== '' ) {
 			delete_user_meta( $user->ID, IdentityHookHandler::MERGED_META_KEY );
 			$removed = true;
 		}
 
 		return $removed;
+	}
+
+	/**
+	 * Remove the WP user with the address from the contact import's list of
+	 * contacts Smaily refused (PRO-3988), lowering its total by as many.
+	 */
+	private function erase_refused_contact( string $email ): bool {
+		$user_id = $this->user_id_for( $email );
+		$stored  = $user_id > 0 ? get_option( BackfillJob::OPTION_REFUSED ) : false;
+		if ( ! is_array( $stored ) || ! is_array( $stored['contacts'] ?? null ) ) {
+			return false;
+		}
+
+		$kept    = array_values(
+			array_filter(
+				$stored['contacts'],
+				static fn ( $entry ): bool => ! is_array( $entry ) || (int) ( $entry['user_id'] ?? 0 ) !== $user_id
+			)
+		);
+		$dropped = count( $stored['contacts'] ) - count( $kept );
+		if ( $dropped === 0 ) {
+			return false;
+		}
+
+		update_option(
+			BackfillJob::OPTION_REFUSED,
+			array(
+				'count'    => max( 0, (int) ( $stored['count'] ?? 0 ) - $dropped ),
+				'contacts' => $kept,
+			),
+			false
+		);
+
+		return true;
 	}
 
 	private function erase_cart_sessions( string $email ): bool {
@@ -437,35 +615,107 @@ class GdprHandler {
 	 * to a row keyed by user_id (see rows_for_privacy_request()).
 	 */
 	private function user_id_for( string $email ): int {
-		$user = get_user_by( 'email', $email );
+		$user = $this->user_for( $email );
 		return $user instanceof \WP_User ? (int) $user->ID : 0;
 	}
 
 	/**
-	 * The customer's orders as WC_Order objects (storage-agnostic — works under
-	 * both legacy posts and HPOS, and gives us $order->get_meta for the rec-meta).
-	 * Protected as a unit-test seam: defining `wc_get_orders` in the unit suite
-	 * would leak into every later test that relies on it being absent.
+	 * The WP user with exactly this address (any letter case), or null.
+	 * get_user_by() compares under the column's collation, which on the usual
+	 * databases ignores accents too, so a request for jane@… would get the
+	 * account of jäne@… — another person (PRO-3986).
+	 */
+	private function user_for( string $email ): ?\WP_User {
+		$user = get_user_by( 'email', $email );
+		if ( ! $user instanceof \WP_User ) {
+			return null;
+		}
+		return strtolower( trim( (string) $user->user_email ) ) === strtolower( trim( $email ) ) ? $user : null;
+	}
+
+	/**
+	 * The ids of the customer's orders, ascending. They come from the active
+	 * order table with no status filter, so an order with a custom status
+	 * (registered or not) or in the trash is found too, and the address
+	 * matches in any letter case (PRO-3908) but not across accents
+	 * (PRO-3986) — `wc_get_orders()` sees only the registered statuses.
+	 * Only the ids: the orders are loaded a page at a time (PRO-3997).
+	 * Protected as a unit-test seam, like load_order().
+	 *
+	 * @return int[]
+	 */
+	protected function order_ids_for( string $email ): array {
+		global $wpdb;
+		if ( ! function_exists( 'wc_get_order' ) ) {
+			return array();
+		}
+		$hpos = class_exists( OrderUtil::class ) && OrderUtil::custom_orders_table_usage_is_enabled();
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The SQL holds table names only; the address is prepare()d.
+		$ids = $wpdb->get_col( $wpdb->prepare( self::order_ids_sql( $hpos, $wpdb->prefix ), $email ) );
+
+		return array_map( 'intval', $ids );
+	}
+
+	/**
+	 * One order as a WC_Order (storage-agnostic — works under both legacy
+	 * posts and HPOS, and gives us $order->get_meta for the rec-meta), or
+	 * null. Protected as a unit-test seam: defining `wc_get_order` in the
+	 * unit suite would leak into every later test that relies on it being
+	 * absent.
+	 */
+	protected function load_order( int $id ): ?\WC_Order {
+		$order = wc_get_order( $id );
+		return $order instanceof \WC_Order ? $order : null;
+	}
+
+	/**
+	 * The orders on one page (1-based) of the exporter or eraser: the next
+	 * ORDERS_PER_PAGE ids in ascending order, loaded. An order placed while
+	 * the request runs gets a higher id, so it only joins the last page.
+	 *
+	 * @param int[] $order_ids
 	 *
 	 * @return \WC_Order[]
 	 */
-	protected function orders_for( string $email ): array {
-		if ( ! function_exists( 'wc_get_orders' ) ) {
-			return array();
-		}
-		$orders = wc_get_orders(
-			array(
-				'limit'         => -1,
-				'billing_email' => $email,
-			)
-		);
-		$out    = array();
-		foreach ( ( is_array( $orders ) ? $orders : array() ) as $order ) {
+	private function orders_on_page( array $order_ids, int $page ): array {
+		$out = array();
+		foreach ( array_slice( $order_ids, ( $page - 1 ) * self::ORDERS_PER_PAGE, self::ORDERS_PER_PAGE ) as $id ) {
+			$order = $this->load_order( $id );
 			if ( $order instanceof \WC_Order ) {
 				$out[] = $order;
 			}
 		}
 		return $out;
+	}
+
+	/**
+	 * Whether this page holds the last of the orders (page 1 with no orders
+	 * at all is the last page).
+	 *
+	 * @param int[] $order_ids
+	 */
+	private static function is_last_page( array $order_ids, int $page ): bool {
+		return count( $order_ids ) <= $page * self::ORDERS_PER_PAGE;
+	}
+
+	/**
+	 * The query for the ids of the orders billed to one address (one `%s`) in
+	 * the active order table: `wc_orders.billing_email` under HPOS, the
+	 * `_billing_email` post meta under legacy storage. No status filter. The
+	 * address matches through AddressMatch::column_equals() — any letter
+	 * case, but bytes after lowering: `LOWER( col ) = LOWER( %s )` alone
+	 * still compares under the column's collation, which on the usual
+	 * databases ignores accents, so jane@… would find jäne@…'s orders
+	 * (PRO-3986, PRO-3909). PURE (no DB) so both storage paths are
+	 * unit-testable.
+	 */
+	public static function order_ids_sql( bool $hpos, string $prefix ): string {
+		$spec = OrderBackfillJob::table_spec( $hpos, $prefix );
+		if ( $hpos ) {
+			return "SELECT {$spec['id_col']} FROM {$spec['table']} WHERE " . AddressMatch::column_equals( 'billing_email' ) . " ORDER BY {$spec['id_col']} ASC";
+		}
+		return "SELECT p.{$spec['id_col']} FROM {$spec['table']} p INNER JOIN {$prefix}postmeta m ON m.post_id = p.{$spec['id_col']} WHERE m.meta_key = '_billing_email' AND " . AddressMatch::column_equals( 'm.meta_value' ) . " ORDER BY p.{$spec['id_col']} ASC";
 	}
 
 	/**

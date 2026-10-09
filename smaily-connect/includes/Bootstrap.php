@@ -56,6 +56,7 @@ use Smaily\Connect\Smaily\Client;
 use Smaily\Connect\Smaily\EventQueue;
 use Smaily\Connect\Smaily\Flusher;
 use Smaily\Connect\Smaily\RecEngine\CatalogPayloadBuilder;
+use Smaily\Connect\Smaily\RecEngine\CatalogManifest;
 use Smaily\Connect\Smaily\RecEngine\CatalogRemoveFlusher;
 use Smaily\Connect\Smaily\RecEngine\Client as RecEngineClient;
 use Smaily\Connect\Smaily\RecEngine\CustomerFlusher;
@@ -107,7 +108,7 @@ final class Bootstrap {
 
 	/**
 	 * How long a verification is trusted. An hour is long enough that the
-	 * eleven existence queries stop being a per-request cost, and short
+	 * twelve existence queries stop being a per-request cost, and short
 	 * enough that a job lost outside the plugin's own lifecycle comes back
 	 * on its own.
 	 */
@@ -196,6 +197,8 @@ final class Bootstrap {
 		// a different endpoint + response shape than the catalog D6 batch
 		// (PRO-1230).
 		add_action( CatalogRemoveFlusher::FLUSH_HOOK, array( $this, 'on_flush_catalog_remove_queue' ) );
+		// The nightly §3c catalog manifest (PRO-3859).
+		add_action( CatalogManifest::HOOK, array( $this, 'on_catalog_manifest' ) );
 		// Customers drain on their own hook — the shared queue routes catalog.*
 		// and customer.* rows to separate flushers (3.3.3).
 		add_action( CustomerFlusher::FLUSH_HOOK, array( $this, 'on_flush_customer_queue' ) );
@@ -246,7 +249,8 @@ final class Bootstrap {
 				return $gdpr_bootstrap->rec_client();
 			},
 			$this->cart_session_store(),
-			$this->event_queue()
+			$this->event_queue(),
+			$this->ingest_queue()
 		) )->register();
 
 		// Proactive health notifications (3.10.2) — a recurring health-check sets
@@ -351,12 +355,7 @@ final class Bootstrap {
 					return null;
 				}
 			case 'products': // 3.5.0 rec-engine catalog backfill.
-				return new CatalogBackfillJob(
-					$this->ingest_queue(),
-					$this->ingest_flusher(),
-					$this->catalog_payload_builder(),
-					$this->multilingual_detector()
-				);
+				return $this->catalog_backfill_job();
 			case 'customers': // 3.5.1 rec-engine customer backfill (A-filter).
 				return new CustomerBackfillJob(
 					$this->ingest_queue(),
@@ -377,7 +376,20 @@ final class Bootstrap {
 	 * same products job the "Import now" button starts.
 	 */
 	public function catalog_import_on_connect(): CatalogImportOnConnect {
-		return new CatalogImportOnConnect( $this->make_backfill_job( CatalogImportOnConnect::JOB_TYPE ) );
+		return new CatalogImportOnConnect( $this->catalog_backfill_job() );
+	}
+
+	/**
+	 * The products import — also the nightly manifest's enumeration, so the
+	 * two can never walk the catalog differently.
+	 */
+	public function catalog_backfill_job(): CatalogBackfillJob {
+		return new CatalogBackfillJob(
+			$this->ingest_queue(),
+			$this->ingest_flusher(),
+			$this->catalog_payload_builder(),
+			$this->multilingual_detector()
+		);
 	}
 
 	/**
@@ -731,6 +743,13 @@ final class Bootstrap {
 			as_schedule_recurring_action( time(), 60, CatalogRemoveFlusher::FLUSH_HOOK, array(), CatalogRemoveFlusher::AS_GROUP );
 		}
 
+		// Nightly catalog manifest (§3c, PRO-3859) — daily, first run at the
+		// next 03:00 store time. A fixed 24 h interval: after a daylight-saving
+		// change it runs an hour off 03:00 until the action is re-created.
+		if ( ! as_has_scheduled_action( CatalogManifest::HOOK, array(), CatalogManifest::AS_GROUP ) ) {
+			as_schedule_recurring_action( CatalogManifest::next_run_timestamp( time() ), DAY_IN_SECONDS, CatalogManifest::HOOK, array(), CatalogManifest::AS_GROUP );
+		}
+
 		// Proactive health check (3.10.2) — every 15 min, recompute the admin-notice
 		// signals (failed-count > threshold in 24h; engine unreachable > 1h). Slow
 		// cadence: it makes a network ping and the signals are coarse-grained.
@@ -789,6 +808,14 @@ final class Bootstrap {
 	 */
 	public function on_flush_catalog_remove_queue(): void {
 		$this->catalog_remove_flusher()->flush();
+	}
+
+	/**
+	 * Action Scheduler callback for smly_rec_catalog_manifest — the nightly
+	 * §3c catalog manifest (PRO-3859).
+	 */
+	public function on_catalog_manifest(): void {
+		$this->catalog_manifest()->run();
 	}
 
 	/**
@@ -1076,6 +1103,23 @@ final class Bootstrap {
 		}
 
 		return $this->catalog_remove_flusher;
+	}
+
+	/**
+	 * The nightly §3c manifest, built on the products import's own
+	 * enumeration so its keys match the catalog sync's.
+	 */
+	public function catalog_manifest(): CatalogManifest {
+		$bootstrap = $this;
+
+		return new CatalogManifest(
+			$this->ingest_queue(),
+			$this->rec_engine_settings(),
+			static function () use ( $bootstrap ): RecEngineClient {
+				return $bootstrap->rec_client( 2, CatalogManifest::TIMEOUT_SECONDS );
+			},
+			$this->catalog_backfill_job()
+		);
 	}
 
 	public function customer_payload_builder(): CustomerPayloadBuilder {

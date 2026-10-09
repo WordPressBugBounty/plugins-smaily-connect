@@ -31,7 +31,9 @@ use WP_REST_Response;
  *   GET    /backfill/status  query: ?job_type=contacts
  *                            → {"status": "running|completed|failed|idle",
  *                               "processed": int, "total": int,
- *                               "percent": int, "eta_seconds": int|null}
+ *                               "percent": int, "eta_seconds": int|null,
+ *                               "error": string|null,
+ *                               "refused": {count, contacts}|null}
  *
  *   POST   /backfill/cancel  body: {"job_type": "contacts"}
  *                            → {"cancelled": bool}
@@ -200,12 +202,24 @@ class BackfillEndpoint {
 					'total'             => 0,
 					'percent'           => 0,
 					'eta_seconds'       => null,
+					'error'             => null,
+					'refused'           => null,
 					'started_at'        => null,
 					'completed_at'      => null,
 					'audience_estimate' => $this->contact_audience_estimate( $job_type, 'idle' ),
 				),
 				200
 			);
+		}
+
+		// An import that nothing drives any more reads as stopped, so the
+		// panel offers to start it again (PRO-3886; the contact import too,
+		// PRO-3902). The route leaves the row alone; only the daily contact
+		// refresh restarts a stalled contact import (PRO-3981).
+		$status  = (string) $row['status'];
+		$stalled = AbstractBackfillJob::is_stalled( $job_type, $row );
+		if ( $stalled ) {
+			$status = BackfillJobInterface::STATUS_FAILED;
 		}
 
 		$processed = (int) $row['processed_count'];
@@ -230,7 +244,7 @@ class BackfillEndpoint {
 		// payload didn't include this state.
 		return new WP_REST_Response(
 			array(
-				'status'            => (string) $row['status'],
+				'status'            => $status,
 				'processed'         => $processed,
 				// F3-55: contacts job — cumulative AUDIENCE members handled
 				// (POSTed + already-fresh). processed counts rows WALKED, so
@@ -244,12 +258,101 @@ class BackfillEndpoint {
 				'total'             => $total,
 				'percent'           => min( 100, max( 0, $percent ) ),
 				'eta_seconds'       => $this->estimate_eta( $row, $processed, $total ),
+				'error'             => $this->failure_reason( $status, $row, $stalled ),
+				'refused'           => $job_type === BackfillJob::BACKFILL_TYPE ? $this->contact_refusals() : null,
 				'started_at'        => isset( $row['started_at'] ) ? (string) $row['started_at'] : null,
 				'completed_at'      => isset( $row['completed_at'] ) ? (string) $row['completed_at'] : null,
-				'audience_estimate' => $this->contact_audience_estimate( $job_type, (string) $row['status'] ),
+				'audience_estimate' => $this->contact_audience_estimate( $job_type, $status ),
 			),
 			200
 		);
+	}
+
+	/**
+	 * Why a failed import stopped, for the panel (PRO-3881): the stored reason
+	 * — what Smaily answered for the contact import, the error class and line
+	 * for a Campaign Intelligence import (PRO-3890) — with anything shaped like
+	 * an email address masked, or a plain sentence for an import that nothing
+	 * drives any more (PRO-3886). Null for any other status. A Smaily refusal
+	 * is stored with the queue's `permanent_envelope_<code>:` class in front
+	 * (RetryPolicy::permanent_envelope(), PRO-3904); the screen shows only
+	 * Smaily's answer after it (PRO-3907).
+	 *
+	 * @param array<string, mixed> $row
+	 */
+	private function failure_reason( string $status, array $row, bool $stalled ): ?string {
+		if ( $status !== BackfillJobInterface::STATUS_FAILED ) {
+			return null;
+		}
+
+		if ( $stalled ) {
+			return __( 'The import stopped running in the background.', 'smaily-connect' );
+		}
+
+		$stored = trim( (string) ( $row['error_message'] ?? '' ) );
+		if ( $stored === '' ) {
+			return null;
+		}
+
+		return $this->screen_reason( $stored );
+	}
+
+	/**
+	 * A stored Smaily reason as the panel shows it: without the queue's
+	 * `permanent_envelope_<code>:` class (PRO-3907) and with anything shaped
+	 * like an email address masked (PRO-3881).
+	 */
+	private function screen_reason( string $stored ): string {
+		$reason = (string) preg_replace( '/^permanent_envelope_\d+:\s*/', '', trim( $stored ) );
+
+		return (string) preg_replace( '/[^\s@]+@[^\s@]+/', '[email]', $reason );
+	}
+
+	/**
+	 * The contacts Smaily refused for good in the contact import's current run
+	 * (PRO-3988), so the merchant can find and fix them: the total, and for up
+	 * to BackfillJob::MAX_LISTED_REFUSALS of them the WordPress user id, the
+	 * address with only its first character before the `@` shown, a link to
+	 * the user's profile, and Smaily's reason. Null when none was refused.
+	 *
+	 * @return array{count: int, contacts: array<int, array{user_id: int, email: string|null, edit_url: string|null, reason: string}>}|null
+	 */
+	private function contact_refusals(): ?array {
+		$stored = get_option( BackfillJob::OPTION_REFUSED );
+		if ( ! is_array( $stored ) || (int) ( $stored['count'] ?? 0 ) <= 0 ) {
+			return null;
+		}
+
+		$contacts = array();
+		foreach ( is_array( $stored['contacts'] ?? null ) ? $stored['contacts'] : array() as $entry ) {
+			$user_id    = is_array( $entry ) ? (int) ( $entry['user_id'] ?? 0 ) : 0;
+			$user       = $user_id > 0 ? get_userdata( $user_id ) : false;
+			$edit_url   = $user instanceof \WP_User ? get_edit_user_link( $user_id ) : '';
+			$contacts[] = array(
+				'user_id'  => $user_id,
+				'email'    => $user instanceof \WP_User ? $this->masked_email( (string) $user->user_email ) : null,
+				'edit_url' => $edit_url !== '' ? $edit_url : null,
+				'reason'   => $this->screen_reason( is_array( $entry ) ? (string) ( $entry['reason'] ?? '' ) : '' ),
+			);
+		}
+
+		return array(
+			'count'    => (int) $stored['count'],
+			'contacts' => $contacts,
+		);
+	}
+
+	/**
+	 * `jane@example.com` → `j***@example.com`: enough to recognise the
+	 * customer, not the whole address.
+	 */
+	private function masked_email( string $email ): string {
+		$at = strrpos( $email, '@' );
+		if ( $at === false || $at === 0 ) {
+			return '***';
+		}
+
+		return mb_substr( substr( $email, 0, $at ), 0, 1 ) . '***' . substr( $email, $at );
 	}
 
 	/**

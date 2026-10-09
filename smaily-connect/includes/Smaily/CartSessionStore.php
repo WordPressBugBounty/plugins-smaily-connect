@@ -11,6 +11,8 @@ namespace Smaily\Connect\Smaily;
 
 defined( 'ABSPATH' ) || exit;
 
+use Smaily\Connect\Privacy\AddressMatch;
+
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared -- Custom plugin table: the interpolated name is $wpdb->prefix + a class constant; every value goes through $wpdb->prepare(). Object-cache is N/A for a write-through tracker.
 
 /**
@@ -175,32 +177,50 @@ class CartSessionStore {
 		$wpdb->delete( $this->table_name(), array( 'user_id' => $user_id ), array( '%d' ) );
 	}
 
+	/**
+	 * Drop every session row of this address. Letter case does not matter;
+	 * an accent does (`jäne@…` is another shopper — PRO-3996, AddressMatch).
+	 * `idx_email` narrows the rows first, so the DELETE reads and locks only
+	 * this address's rows, not the whole table (PRO-4004).
+	 */
 	public function delete_by_email( string $email ): void {
 		global $wpdb;
-		if ( $email === '' ) {
+		$match = AddressMatch::column_equals_indexed( 'email', $email );
+		if ( $match === null ) {
 			return;
 		}
-		$wpdb->delete( $this->table_name(), array( 'email' => $email ), array( '%s' ) );
+		// phpcs:disable WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- The %s placeholders come from AddressMatch::column_equals_indexed(), with its arguments.
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$this->table_name()} WHERE {$match[0]}",
+				...$match[1]
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 	}
 
 	/**
 	 * Drop other session rows that carry the same email (the guest-remnant
 	 * case: a guest entered their email at checkout, then logged in — the
 	 * login migrates the cart to a new session token and the old guest row
-	 * would double-remind the same address).
+	 * would double-remind the same address). Same address match as
+	 * delete_by_email() (PRO-3996), through `idx_email` (PRO-4004): this
+	 * runs on every tracked cart update with a known address.
 	 */
 	public function delete_other_rows_for_email( string $email, string $keep_token ): void {
 		global $wpdb;
-		if ( $email === '' || $keep_token === '' ) {
+		$match = AddressMatch::column_equals_indexed( 'email', $email );
+		if ( $match === null || $keep_token === '' ) {
 			return;
 		}
+		// phpcs:disable WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- The address %s placeholders come from AddressMatch::column_equals_indexed(), with its arguments.
 		$wpdb->query(
 			$wpdb->prepare(
-				"DELETE FROM {$this->table_name()} WHERE email = %s AND cart_token != %s",
-				$email,
-				$keep_token
+				"DELETE FROM {$this->table_name()} WHERE {$match[0]} AND cart_token != %s",
+				...array_merge( $match[1], array( $keep_token ) )
 			)
 		);
+		// phpcs:enable WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 	}
 
 	/**
@@ -327,16 +347,19 @@ class CartSessionStore {
 	/**
 	 * The shared match condition for both privacy-request methods above, so
 	 * the lookup and the delete can never drift apart on what counts as "this
-	 * subject's rows".
+	 * subject's rows". The address is matched by the shared
+	 * AddressMatch::column_equals() (PRO-3993, PRO-3909): letter case does
+	 * not matter, an accent does — `jäne@` is someone else's mailbox than
+	 * `jane@`.
 	 *
 	 * @return array{0: string, 1: array<int, string|int>}|null
 	 */
 	private function privacy_request_where( string $email, int $user_id ): ?array {
 		if ( $email !== '' && $user_id > 0 ) {
-			return array( 'email = %s OR user_id = %d', array( $email, $user_id ) );
+			return array( AddressMatch::column_equals( 'email' ) . ' OR user_id = %d', array( $email, $user_id ) );
 		}
 		if ( $email !== '' ) {
-			return array( 'email = %s', array( $email ) );
+			return array( AddressMatch::column_equals( 'email' ), array( $email ) );
 		}
 		if ( $user_id > 0 ) {
 			return array( 'user_id = %d', array( $user_id ) );
