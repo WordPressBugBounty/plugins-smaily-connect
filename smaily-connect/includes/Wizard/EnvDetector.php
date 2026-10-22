@@ -14,6 +14,7 @@ defined( 'ABSPATH' ) || exit;
 
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.PreparedSQLPlaceholders.UnquotedComplexPlaceholder, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Custom plugin tables: interpolated values are $wpdb->prepare()d (dynamic IN() lists build placeholder strings); object-cache is N/A for a write-through queue / cleanup / DDL path.
 
+use Smaily\Connect\Bootstrap;
 use Smaily\Connect\Constants;
 use Smaily\Connect\Integrations\WooCommerce\StorefrontBeacon;
 use Smaily\Connect\Multilingual\DetectorFactory;
@@ -25,7 +26,9 @@ use Smaily\Connect\Settings\Credentials;
 use Smaily\Connect\Settings\RecEngineSettings;
 use Smaily\Connect\Settings\SetupState;
 use Smaily\Connect\Smaily\ContactSyncMode;
+use Smaily\Connect\Smaily\RecEngine\Backfill\OrderBackfillJob;
 use Smaily\Connect\Smaily\SubscriberPayloadBuilder;
+use Smaily\Connect\Smaily\TransactionalGate;
 use Smaily\Connect\Smaily\TransactionalPayloadBuilder;
 
 /**
@@ -60,6 +63,7 @@ use Smaily\Connect\Smaily\TransactionalPayloadBuilder;
  *     docsUrl: string,
  *     orderStatuses: array<{slug, name}>,
  *     consentApiPresent: bool,
+ *     followUpDelayLimits: { min: int, max: int, default: int },
  *   }
  *
  * The React bundle reads everything that's not in WizardState.env
@@ -88,30 +92,38 @@ class EnvDetector {
 	 *   docsUrl: string,
 	 *   orderStatuses: array<int, array{slug: string, name: string}>,
 	 *   consentApiPresent: bool,
+	 *   followUpDelayLimits: array{min: int, max: int, default: int},
 	 * }
 	 */
 	public function snapshot(): array {
 		return array(
-			'detectedLanguages'  => $this->detected_languages(),
-			'multilingualPlugin' => $this->multilingual_plugin(),
-			'elementorPresent'   => $this->elementor_present(),
-			'cf7Present'         => $this->cf7_present(),
-			'wcActive'           => $this->wc_active(),
-			'hposActive'         => $this->hpos_active(),
-			'storeTotals'        => $this->store_totals(),
-			'rss'                => $this->rss_snapshot(),
+			'detectedLanguages'   => $this->detected_languages(),
+			'multilingualPlugin'  => $this->multilingual_plugin(),
+			'elementorPresent'    => $this->elementor_present(),
+			'cf7Present'          => $this->cf7_present(),
+			'wcActive'            => $this->wc_active(),
+			'hposActive'          => $this->hpos_active(),
+			'storeTotals'         => $this->store_totals(),
+			'rss'                 => $this->rss_snapshot(),
 			// Base merchant-docs URL (PRO-1430) — Constants::docs_url() is the
 			// single place this can move/be filtered; the React "How to add a
 			// Smaily signup form" section appends its own #anchor client-side.
-			'docsUrl'            => Constants::docs_url(),
+			'docsUrl'             => Constants::docs_url(),
 			// PRO-1504 — registered WooCommerce order statuses (incl. custom
 			// ones), choices for the "counts as shipped" multi-select.
-			'orderStatuses'      => $this->order_statuses(),
+			'orderStatuses'       => $this->order_statuses(),
 			// PRO-3673 — whether the WP Consent API is active, the same check
 			// NotificationManager's consent advisory makes: without it the
 			// browse tracker gets no consent signal and sends nothing, and the
 			// browse-tracking toggle says so.
-			'consentApiPresent'  => StorefrontBeacon::consent_api_present(),
+			'consentApiPresent'   => StorefrontBeacon::consent_api_present(),
+			// PRO-4095 — the follow-up delay's range and default, so the
+			// "Days to wait" field uses the values the save route validates by.
+			'followUpDelayLimits' => array(
+				'min'     => TransactionalGate::FOLLOW_UP_DELAY_MIN,
+				'max'     => TransactionalGate::FOLLOW_UP_DELAY_MAX,
+				'default' => TransactionalGate::FOLLOW_UP_DELAY_DEFAULT,
+			),
 		);
 	}
 
@@ -229,7 +241,7 @@ class EnvDetector {
 		}
 		$statuses = array();
 		foreach ( wc_get_order_statuses() as $key => $label ) {
-			$slug       = ( strpos( (string) $key, 'wc-' ) === 0 ) ? substr( (string) $key, 3 ) : (string) $key;
+			$slug       = OrderBackfillJob::bare_status( (string) $key );
 			$statuses[] = array(
 				'slug' => $slug,
 				'name' => (string) $label,
@@ -412,9 +424,13 @@ class EnvDetector {
 	 * UI re-renders the password field as an empty input ("***"
 	 * placeholder) and a no-op save leaves the stored value untouched.
 	 *
+	 * @param bool $with_transactional_status False for the wizard screen: only
+	 *                                        Settings shows the confirmation
+	 *                                        cards' status line, so the wizard
+	 *                                        skips its queries (an empty list).
 	 * @return array<string, mixed>
 	 */
-	public function saved_settings(): array {
+	public function saved_settings( bool $with_transactional_status = true ): array {
 		$creds             = new Credentials();
 		$set               = $creds->get();
 		$transactional_set = $creds->get( 'transactional' );
@@ -495,8 +511,14 @@ class EnvDetector {
 			'orderConfirmationEnabled'      => (bool) get_option( 'smly_plus_order_confirmation_enabled', false ),
 			'shippingConfirmationEnabled'   => (bool) get_option( 'smly_plus_shipping_confirmation_enabled', false ),
 			'shippedOrderStatuses'          => (array) get_option( 'smly_plus_shipped_order_statuses', array( 'completed' ) ),
+			// The follow-up email (PRO-4095) — off, `completed`, 7 days by default.
+			'followUpEnabled'               => (bool) get_option( TransactionalGate::TRIGGERS[ TransactionalGate::TRIGGER_FOLLOW_UP ]['toggle_option'], false ),
+			'followUpOrderStatuses'         => TransactionalGate::follow_up_statuses(),
+			'followUpDelayDays'             => TransactionalGate::follow_up_delay_days(),
 			// PRO-3190: addresses, phone and order note in both confirmations — off by default.
 			'transactionalPersonalData'     => (bool) get_option( TransactionalPayloadBuilder::OPTION_PERSONAL_DATA, false ),
+			// PRO-4091: each confirmation card's status line.
+			'transactionalStatus'           => $with_transactional_status ? $this->transactional_status() : array(),
 
 			// Step 4: rec-engine connection state (sub-PR 3.1). The
 			// api_key is DELIBERATELY omitted from the boot payload —
@@ -508,6 +530,24 @@ class EnvDetector {
 			// tohi kunagi olla client-side koodis").
 			'recEngine'                     => $this->rec_engine_snapshot(),
 		);
+	}
+
+	/**
+	 * The confirmation cards' status lines — TransactionalStatus, read
+	 * through the same send gate the plugin uses.
+	 *
+	 * @return array<string, mixed>
+	 */
+	private function transactional_status(): array {
+		/** @var \wpdb|null $wpdb */
+		global $wpdb;
+		// Same unit-test guard as automation_mappings(): it reads the
+		// mapping and queue tables.
+		if ( ! ( $wpdb instanceof \wpdb ) ) {
+			return array();
+		}
+
+		return Bootstrap::instance()->transactional_status()->snapshot();
 	}
 
 	/**

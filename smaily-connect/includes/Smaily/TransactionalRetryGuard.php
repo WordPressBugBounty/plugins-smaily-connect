@@ -77,6 +77,13 @@ final class TransactionalRetryGuard {
 
 		$payload = TransactionalFlusher::read_payload( $payload_json );
 
+		if ( $event_type === TransactionalFlusher::EVENT_TYPE_FOLLOW_UP ) {
+			// The follow-up has no WooCommerce email to fall back to
+			// (PRO-4095), so a failed one reached nobody — unless it was a
+			// deliberate second one, whose first still stands.
+			return empty( $payload[ TransactionalFlusher::PAYLOAD_KEY_RESEND ] ) ? '' : self::REASON_RESEND_FAILED;
+		}
+
 		if ( $event_type !== TransactionalFlusher::EVENT_TYPE_SHIPPING_CONFIRMATION ) {
 			return self::wc_email_reason( $payload );
 		}
@@ -122,12 +129,17 @@ final class TransactionalRetryGuard {
 	 * The order must still exist — a re-send rebuilds its content from the
 	 * live order.
 	 *
-	 * @param bool $order_exists Resolved by the caller, never here — same
-	 *                           batched lookup refusal_reason() takes.
+	 * A skipped row (PRO-4091) is stored `sent` too, but nothing reached
+	 * the shopper, so there is no first email to follow up on.
+	 *
+	 * @param bool   $order_exists  Resolved by the caller, never here — same
+	 *                              batched lookup refusal_reason() takes.
+	 * @param string $last_response The row's stored exchange summary.
 	 */
-	public static function resendable( string $event_type, string $status, bool $order_exists ): bool {
+	public static function resendable( string $event_type, string $status, bool $order_exists, string $last_response = '' ): bool {
 		return self::is_transactional( $event_type )
 			&& $status === EventQueue::STATUS_SENT
+			&& EventQueue::skip_reason( $last_response ) === ''
 			&& $order_exists;
 	}
 

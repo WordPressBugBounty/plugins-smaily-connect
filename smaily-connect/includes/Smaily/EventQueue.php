@@ -122,6 +122,34 @@ class EventQueue {
 	 *                  queue is momentarily unreachable.
 	 */
 	public function enqueue( string $event_type, string $entity_id, array $payload ): ?int {
+		$id = $this->insert_pending( $event_type, $entity_id, $payload, null );
+		if ( $id !== null ) {
+			$this->maybe_schedule_flush();
+		}
+
+		return $id;
+	}
+
+	/**
+	 * Persist an event that is not due until $due_at (PRO-4095 — the
+	 * follow-up email's delay). The row waits as `pending` with
+	 * next_retry_at = $due_at, so pending() leaves it out until then — the
+	 * same park a retry backoff uses (PRO-1685). Its own flusher's
+	 * recurring pass picks it up once due, so no flush is scheduled here.
+	 *
+	 * @param array<string, mixed> $payload See enqueue().
+	 * @param string               $due_at  UTC "Y-m-d H:i:s".
+	 *
+	 * @return int|null Inserted row id, or null if the insert failed (silent, like enqueue()).
+	 */
+	public function enqueue_scheduled( string $event_type, string $entity_id, array $payload, string $due_at ): ?int {
+		return $this->insert_pending( $event_type, $entity_id, $payload, $due_at );
+	}
+
+	/**
+	 * @param array<string, mixed> $payload
+	 */
+	private function insert_pending( string $event_type, string $entity_id, array $payload, ?string $due_at ): ?int {
 		global $wpdb;
 
 		$json = wp_json_encode( $payload );
@@ -131,28 +159,25 @@ class EventQueue {
 
 		$email = isset( $payload['email'] ) && is_string( $payload['email'] ) ? $payload['email'] : '';
 
-		$inserted = $wpdb->insert(
-			$this->table_name(),
-			array(
-				'event_type'  => $event_type,
-				'entity_id'   => $entity_id,
-				'payload'     => $json,
-				'contact_key' => $email === '' ? null : self::contact_key( $email ),
-				'created_at'  => current_time( 'mysql', true ),
-				'attempts'    => 0,
-				'status'      => self::STATUS_PENDING,
-			),
-			array( '%s', '%s', '%s', '%s', '%s', '%d', '%s' )
+		$data   = array(
+			'event_type'  => $event_type,
+			'entity_id'   => $entity_id,
+			'payload'     => $json,
+			'contact_key' => $email === '' ? null : self::contact_key( $email ),
+			'created_at'  => current_time( 'mysql', true ),
+			'attempts'    => 0,
+			'status'      => self::STATUS_PENDING,
 		);
+		$format = array( '%s', '%s', '%s', '%s', '%s', '%d', '%s' );
 
-		if ( $inserted !== 1 ) {
-			return null;
+		if ( $due_at !== null ) {
+			$data['next_retry_at'] = $due_at;
+			$format[]              = '%s';
 		}
 
-		$id = (int) $wpdb->insert_id;
-		$this->maybe_schedule_flush();
+		$inserted = $wpdb->insert( $this->table_name(), $data, $format );
 
-		return $id;
+		return $inserted === 1 ? (int) $wpdb->insert_id : null;
 	}
 
 	/**
@@ -499,6 +524,86 @@ class EventQueue {
 		return is_array( $decoded ) && ( $decoded['outcome'] ?? '' ) === self::OUTCOME_CANCELLED;
 	}
 
+	/**
+	 * Record a send that could not happen, as one finished row (PRO-4091):
+	 * written straight as the established terminal-skip pair (`sent`, no
+	 * sent_payload, a `skipped` exchange), so no flusher ever drains it and
+	 * nothing is scheduled. It carries the entity id and the reason code
+	 * only — no payload, so no recipient or other personal data.
+	 *
+	 * @return int|null Inserted row id, or null if the insert failed (silent, like enqueue()).
+	 */
+	public function record_skipped( string $event_type, string $entity_id, string $reason ): ?int {
+		global $wpdb;
+
+		$inserted = $wpdb->insert(
+			$this->table_name(),
+			array(
+				'event_type'    => $event_type,
+				'entity_id'     => $entity_id,
+				'payload'       => '[]',
+				'contact_key'   => null,
+				'created_at'    => current_time( 'mysql', true ),
+				'attempts'      => 0,
+				'status'        => self::STATUS_SENT,
+				'sent_payload'  => null,
+				'last_response' => self::skipped_response( $reason ),
+			),
+			array( '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s' )
+		);
+
+		return $inserted === 1 ? (int) $wpdb->insert_id : null;
+	}
+
+	/**
+	 * Finish an existing row as skipped (PRO-4095): the same terminal
+	 * shape record_skipped() writes — `sent`, no sent_payload, a `skipped`
+	 * exchange with the reason — for a queued send that may no longer go
+	 * out when it falls due. Nothing retries it.
+	 */
+	public function mark_skipped( int $id, string $reason ): void {
+		global $wpdb;
+		$wpdb->update(
+			$this->table_name(),
+			array(
+				'status'        => self::STATUS_SENT,
+				'sent_payload'  => null,
+				'last_response' => self::skipped_response( $reason ),
+			),
+			array( 'id' => $id ),
+			array( '%s', '%s', '%s' ),
+			array( '%d' )
+		);
+	}
+
+	/**
+	 * The `last_response` a skipped row stores — record_skipped() and
+	 * mark_skipped() write the same shape, which skip_reason() reads.
+	 */
+	private static function skipped_response( string $reason ): string {
+		return (string) wp_json_encode(
+			array(
+				'outcome' => self::OUTCOME_SKIPPED,
+				'reason'  => $reason,
+			)
+		);
+	}
+
+	/**
+	 * The reason code a record_skipped() row carries, or '' for any other
+	 * stored response — including the flushers' own terminal skips, which
+	 * record a note but no reason. The one place that knows that shape.
+	 */
+	public static function skip_reason( string $last_response ): string {
+		$decoded = json_decode( $last_response, true );
+
+		if ( ! is_array( $decoded ) || ( $decoded['outcome'] ?? '' ) !== self::OUTCOME_SKIPPED ) {
+			return '';
+		}
+
+		return isset( $decoded['reason'] ) && is_string( $decoded['reason'] ) ? $decoded['reason'] : '';
+	}
+
 	public function mark_sent( int $id ): void {
 		global $wpdb;
 		$wpdb->update(
@@ -637,7 +742,9 @@ class EventQueue {
 	 * flusher's one-hour ceiling (PRO-1519) is measured from created_at, so a
 	 * revived transactional row would otherwise terminal-fail on the very next
 	 * tick — the retry has to give it a fresh hour. Deliberately narrow: only
-	 * /events/retry calls it, and only for the transactional rows it revived.
+	 * /events/retry calls it, for the transactional rows it revived, and the
+	 * transactional flusher, for a follow-up row it has just finished
+	 * (CON-169 — the row then dates from its send, not from its queueing).
 	 * Returns the row count.
 	 *
 	 * @param int[] $ids

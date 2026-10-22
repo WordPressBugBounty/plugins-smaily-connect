@@ -18,6 +18,7 @@ use Smaily\Connect\Integrations\WooCommerce\LegacyHookBridge;
 use Smaily\Connect\Settings\Credentials;
 use Smaily\Connect\Settings\SetupState;
 use Smaily\Connect\Smaily\ContactSyncMode;
+use Smaily\Connect\Smaily\TransactionalGate;
 use Smaily\Connect\Smaily\TransactionalPayloadBuilder;
 use WP_Error;
 use WP_REST_Request;
@@ -80,7 +81,23 @@ class SettingsEndpoint {
 		'abandoned_cart',
 		'order_confirmation',
 		'shipping_confirmation',
+		'follow_up',
 	);
+
+	/**
+	 * Builds the confirmation cards' status lines (PRO-4091) — null leaves
+	 * them out of the answer.
+	 *
+	 * @var (callable(): array<string, mixed>)|null
+	 */
+	private $transactional_status;
+
+	/**
+	 * @param (callable(): array<string, mixed>)|null $transactional_status See the property.
+	 */
+	public function __construct( ?callable $transactional_status = null ) {
+		$this->transactional_status = $transactional_status;
+	}
 
 	public function register(): void {
 		register_rest_route(
@@ -319,6 +336,29 @@ class SettingsEndpoint {
 	 * @param array<string, mixed> $data
 	 */
 	private function save_woocommerce( array $data ): WP_REST_Response {
+		// The follow-up delay (PRO-4095) is checked before anything on the
+		// tab is written, so a refused save changes nothing.
+		$follow_up_delay = null;
+		if ( array_key_exists( 'followUpDelayDays', $data ) ) {
+			$follow_up_delay = TransactionalGate::delay_days_or_null( $data['followUpDelayDays'] );
+			if ( $follow_up_delay === null ) {
+				return $this->error_response(
+					array(
+						array(
+							'field'   => 'followUpDelayDays',
+							'message' => sprintf(
+								/* translators: 1: the shortest delay in days, 2: the longest. */
+								__( 'The follow-up email delay must be a whole number of days from %1$d to %2$d.', 'smaily-connect' ),
+								TransactionalGate::FOLLOW_UP_DELAY_MIN,
+								TransactionalGate::FOLLOW_UP_DELAY_MAX
+							),
+						),
+					),
+					400
+				);
+			}
+		}
+
 		$welcome  = ! empty( $data['welcomeEnabled'] );
 		$first    = ! empty( $data['firstOrderEnabled'] );
 		$cart     = ! empty( $data['abandonedCartEnabled'] );
@@ -352,6 +392,7 @@ class SettingsEndpoint {
 		update_option( self::LEGACY_OPTION_CART_CUTOFF, $cutoff );
 
 		$this->save_transactional_triggers( $data );
+		$this->save_follow_up( $data, $follow_up_delay );
 
 		// Replace the mapping table contents in one shot — Settings always
 		// sends the full list it wants persisted, no partial updates.
@@ -407,15 +448,45 @@ class SettingsEndpoint {
 		$statuses_raw = isset( $data['shippedOrderStatuses'] ) && is_array( $data['shippedOrderStatuses'] )
 			? $data['shippedOrderStatuses']
 			: array();
-		$statuses     = array_values(
+		update_option( 'smly_plus_shipped_order_statuses', self::sanitize_statuses( $statuses_raw ) );
+	}
+
+	/**
+	 * A status list from the payload as bare, non-empty status keys —
+	 * the one rule both status sets (shipped, follow-up) are saved by.
+	 *
+	 * @param array<mixed> $statuses
+	 *
+	 * @return string[]
+	 */
+	private static function sanitize_statuses( array $statuses ): array {
+		return array_values(
 			array_filter(
 				array_map(
 					static fn ( $s ): string => sanitize_key( (string) $s ),
-					$statuses_raw
+					$statuses
 				)
 			)
 		);
-		update_option( 'smly_plus_shipped_order_statuses', $statuses );
+	}
+
+	/**
+	 * The follow-up email (PRO-4095): its switch, the statuses that start
+	 * its delay, and the delay — already validated by save_woocommerce(),
+	 * null when the payload carried none (left as stored).
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function save_follow_up( array $data, ?int $delay_days ): void {
+		update_option( TransactionalGate::TRIGGERS[ TransactionalGate::TRIGGER_FOLLOW_UP ]['toggle_option'], ! empty( $data['followUpEnabled'] ) );
+
+		if ( isset( $data['followUpOrderStatuses'] ) && is_array( $data['followUpOrderStatuses'] ) ) {
+			update_option( TransactionalGate::OPTION_FOLLOW_UP_STATUSES, self::sanitize_statuses( $data['followUpOrderStatuses'] ) );
+		}
+
+		if ( $delay_days !== null ) {
+			update_option( TransactionalGate::OPTION_FOLLOW_UP_DELAY_DAYS, $delay_days );
+		}
 	}
 
 	/**
@@ -526,13 +597,17 @@ class SettingsEndpoint {
 	}
 
 	private function success_response(): WP_REST_Response {
-		return new WP_REST_Response(
-			array(
-				'saved'  => true,
-				'errors' => array(),
-			),
-			200
+		$data = array(
+			'saved'  => true,
+			'errors' => array(),
 		);
+
+		// Read after the write, so the card's status line reflects the save.
+		if ( $this->transactional_status !== null ) {
+			$data['transactionalStatus'] = ( $this->transactional_status )();
+		}
+
+		return new WP_REST_Response( $data, 200 );
 	}
 
 	/**

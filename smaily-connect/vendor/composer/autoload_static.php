@@ -119,6 +119,7 @@ class ComposerStaticInitc9bd3d1d72511ce8fa30a9390fed4aef
         'Smaily\\Connect\\Smaily\\TransactionalPayloadBuilder' => __DIR__ . '/../..' . '/includes/Smaily/TransactionalPayloadBuilder.php',
         'Smaily\\Connect\\Smaily\\TransactionalResend' => __DIR__ . '/../..' . '/includes/Smaily/TransactionalResend.php',
         'Smaily\\Connect\\Smaily\\TransactionalRetryGuard' => __DIR__ . '/../..' . '/includes/Smaily/TransactionalRetryGuard.php',
+        'Smaily\\Connect\\Smaily\\TransactionalStatus' => __DIR__ . '/../..' . '/includes/Smaily/TransactionalStatus.php',
         'Smaily\\Connect\\Smaily\\TransactionalSuppression' => __DIR__ . '/../..' . '/includes/Smaily/TransactionalSuppression.php',
         'Smaily\\Connect\\Smaily\\WorkflowMatch' => __DIR__ . '/../..' . '/includes/Smaily/WorkflowMatch.php',
         'Smaily\\Connect\\Smaily\\WorkflowResolverInterface' => __DIR__ . '/../..' . '/includes/Smaily/WorkflowResolverInterface.php',
