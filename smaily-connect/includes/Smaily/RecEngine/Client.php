@@ -104,7 +104,7 @@ class Client {
 	// NOT sprintf `%s` — feeding a `{email}` URL through sprintf leaves it
 	// unchanged and the engine receives the literal string `{email}`. These
 	// fallbacks use the same `{email}` placeholder so map-path and fallback-path
-	// substitute identically via customer_url().
+	// substitute identically via templated_url().
 	public const PATH_CUSTOMER_EXPORT_TMPL  = '/api/v1/customer/{email}/export';
 	public const PATH_CUSTOMER_DELETE_TMPL  = '/api/v1/customer/{email}';
 	public const PATH_CUSTOMER_OPT_OUT_TMPL = '/api/v1/customer/{email}/opt-out';
@@ -119,6 +119,12 @@ class Client {
 	// `recommendations_customer`; a connection exchanged before v1.9.0 has no
 	// such key, so this fallback serves every existing connection.
 	public const PATH_RECOMMENDATIONS_CUSTOMER = '/api/v1/recommendations/customer';
+	// Email designs (contract v1.17.0, §22–§23). Map keys `emails_design_link`
+	// and `emails_designs`; a connection exchanged before the engine returned
+	// them has no such keys, so these fallbacks serve it. `{email_key}` is a
+	// placeholder like `{email}` — substituted, never sprintf'd.
+	public const PATH_EMAILS_DESIGN_LINK_TMPL = '/api/v1/emails/{email_key}/design-link';
+	public const PATH_EMAILS_DESIGNS          = '/api/v1/emails/designs';
 
 	/** Default in-request retry ceiling — generous for one-shot calls (ping, setup). */
 	public const DEFAULT_MAX_ATTEMPTS = 5;
@@ -419,7 +425,7 @@ class Client {
 	 * @throws ApiException On 4xx (incl. 404 not_found) or network failure.
 	 */
 	public function customer_export( string $email, array $query = array() ): array {
-		$url = $this->customer_url( 'customer_export', self::PATH_CUSTOMER_EXPORT_TMPL, $email );
+		$url = $this->templated_url( 'customer_export', self::PATH_CUSTOMER_EXPORT_TMPL, '{email}', $email, true );
 		if ( $query !== array() ) {
 			$url .= '?' . http_build_query( $query );
 		}
@@ -438,7 +444,7 @@ class Client {
 	 * @throws ApiException On 4xx (incl. 404) or network failure.
 	 */
 	public function customer_delete( string $email, array $body = array() ): array {
-		$url = $this->customer_url( 'customer_delete', self::PATH_CUSTOMER_DELETE_TMPL, $email );
+		$url = $this->templated_url( 'customer_delete', self::PATH_CUSTOMER_DELETE_TMPL, '{email}', $email, true );
 		return $this->request_url( 'DELETE', $url, $body !== array() ? $body : null );
 	}
 
@@ -454,7 +460,7 @@ class Client {
 	 * @throws ApiException On 4xx or network failure.
 	 */
 	public function customer_opt_out( string $email, array $body ): array {
-		$url = $this->customer_url( 'customer_opt_out', self::PATH_CUSTOMER_OPT_OUT_TMPL, $email );
+		$url = $this->templated_url( 'customer_opt_out', self::PATH_CUSTOMER_OPT_OUT_TMPL, '{email}', $email, true );
 		return $this->request_url( 'POST', $url, $body );
 	}
 
@@ -563,6 +569,37 @@ class Client {
 		);
 	}
 
+	/**
+	 * A one-time link to the engine's design page for one email (§22) —
+	 * `{url, expires_at}`. The link is opened at once in a new tab and never
+	 * stored or logged. `$body` carries the optional `return_url` and
+	 * `language`; an empty body is sent as `{}`.
+	 *
+	 * @param array<string, string> $body
+	 *
+	 * @return array<string, mixed>
+	 *
+	 * @throws ApiException On 4xx (incl. 404 unknown_email, 422) or network failure.
+	 */
+	public function email_design_link( string $email_key, array $body ): array {
+		$url = $this->templated_url( 'emails_design_link', self::PATH_EMAILS_DESIGN_LINK_TMPL, '{email_key}', $email_key );
+		return $this->request_url( 'POST', $url, $body );
+	}
+
+	/**
+	 * Every email design of the store (§23) — `{emails: [...]}`, one item per
+	 * email key the store can design, with its design state and Smaily ids.
+	 * Read when the email settings open and on return from the design page,
+	 * never before a send run.
+	 *
+	 * @return array<string, mixed>
+	 *
+	 * @throws ApiException On 4xx (incl. 404 while the engine does not offer it) or network failure.
+	 */
+	public function email_designs(): array {
+		return $this->request_url( 'GET', $this->resolve_url( 'emails_designs', self::PATH_EMAILS_DESIGNS ) );
+	}
+
 	// ---------------------------------------------------------------
 	// Private request engine.
 	// ---------------------------------------------------------------
@@ -588,22 +625,24 @@ class Client {
 	}
 
 	/**
-	 * Build a GDPR customer-endpoint URL by substituting the `{email}`
-	 * placeholder. The engine advertises these URLs with a literal `{email}`
-	 * token (in both the endpoints-map value and our fallback template), so the
-	 * substitution is a str_replace — NOT sprintf, which would silently leave a
-	 * `{email}`-style URL unchanged and send the literal placeholder to the
-	 * engine. The email is rawurlencoded for the path segment. As a defensive
-	 * fallback, a resolved URL that carries no `{email}` token but still has a
-	 * legacy `%s` is handled too.
+	 * Build an endpoint URL that carries a value in its PATH by substituting
+	 * a `{placeholder}` token (`{email}` for the GDPR customer URLs,
+	 * `{email_key}` for the design link). The engine advertises these URLs
+	 * with the literal token (in both the endpoints-map value and our
+	 * fallback template), so the substitution is a str_replace — NOT sprintf,
+	 * which would silently leave a `{email}`-style URL unchanged and send the
+	 * literal placeholder to the engine. The value is rawurlencoded for the
+	 * path segment. With `$legacy_sprintf` (the GDPR customer URLs only), a
+	 * resolved URL that carries no token but still has a legacy `%s` is
+	 * handled too, as a defensive fallback.
 	 */
-	private function customer_url( string $endpoint_key, string $fallback_template, string $email ): string {
+	private function templated_url( string $endpoint_key, string $fallback_template, string $placeholder, string $value, bool $legacy_sprintf = false ): string {
 		$url = $this->resolve_url( $endpoint_key, $fallback_template );
-		$enc = rawurlencode( $email );
-		if ( strpos( $url, '{email}' ) !== false ) {
-			return str_replace( '{email}', $enc, $url );
+		$enc = rawurlencode( $value );
+		if ( strpos( $url, $placeholder ) !== false ) {
+			return str_replace( $placeholder, $enc, $url );
 		}
-		if ( strpos( $url, '%s' ) !== false ) {
+		if ( $legacy_sprintf && strpos( $url, '%s' ) !== false ) {
 			return sprintf( $url, $enc );
 		}
 		return $url;
@@ -639,8 +678,9 @@ class Client {
 		$attempts     = 0;
 		$backoff      = 1;
 		$max_attempts = $single_attempt ? 1 : $this->max_attempts;
-		// Encoded once: every attempt sends the same bytes.
-		$json = $body !== null ? (string) wp_json_encode( $body ) : null;
+		// Encoded once: every attempt sends the same bytes. An empty body is
+		// the JSON object `{}` (§22), not the list `[]` wp_json_encode() makes.
+		$json = $body !== null ? ( $body === array() ? '{}' : (string) wp_json_encode( $body ) ) : null;
 
 		while ( true ) {
 			++$attempts;

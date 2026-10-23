@@ -1,9 +1,9 @@
 <?php return array(
     'root' => array(
         'name' => 'smaily/smaily-wordpress-plugin',
-        'pretty_version' => '3.18.0',
-        'version' => '3.18.0.0',
-        'reference' => 'd3209dabb42cfad8a06f6c482dbab6a597c3e106',
+        'pretty_version' => '3.19.0',
+        'version' => '3.19.0.0',
+        'reference' => '9c62e4f93acebd9f0d25481d823726ea224dea3d',
         'type' => 'wordpress-plugin',
         'install_path' => __DIR__ . '/../../',
         'aliases' => array(),
@@ -11,9 +11,9 @@
     ),
     'versions' => array(
         'smaily/smaily-wordpress-plugin' => array(
-            'pretty_version' => '3.18.0',
-            'version' => '3.18.0.0',
-            'reference' => 'd3209dabb42cfad8a06f6c482dbab6a597c3e106',
+            'pretty_version' => '3.19.0',
+            'version' => '3.19.0.0',
+            'reference' => '9c62e4f93acebd9f0d25481d823726ea224dea3d',
             'type' => 'wordpress-plugin',
             'install_path' => __DIR__ . '/../../',
             'aliases' => array(),

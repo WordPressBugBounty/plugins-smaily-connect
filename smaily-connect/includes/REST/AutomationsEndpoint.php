@@ -15,7 +15,6 @@ use Smaily\Connect\Constants;
 use Smaily\Connect\Settings\RecEngineSettings;
 use Smaily\Connect\Smaily\RecEngine\ApiException;
 use Smaily\Connect\Smaily\RecEngine\Client;
-use WP_Error;
 use WP_REST_Request;
 use WP_REST_Response;
 
@@ -48,8 +47,9 @@ use WP_REST_Response;
  *     engine-side (operator "admin") edits and against catalog changes that
  *     ship with engine deploys.
  *   - No duplicate validation. PUT forwards `configs` to the engine as-is
- *     (only a minimal is-array shape check, and a `test_mode: false` is
- *     left out — CON-172) — the engine's Zod schema is the
+ *     (only a minimal is-array shape check, a `test_mode: false` is
+ *     left out — CON-172 — and an empty `automation_map` is sent as `{}`,
+ *     CON-180) — the engine's Zod schema is the
  *     validator, and its indexed 422 comes back verbatim. A PHP-side copy of
  *     the rules would be a second source of truth that drifts.
  *   - The api_key never reaches the browser: this proxy decrypts the stored
@@ -68,13 +68,10 @@ use WP_REST_Response;
  */
 class AutomationsEndpoint {
 
+	use RecEngineProxy;
+
 	public const ROUTE_CATALOG = '/rec-engine/automations/catalog';
 	public const ROUTE_CONFIG  = '/rec-engine/automations/config';
-
-	private RecEngineSettings $settings;
-
-	/** @var callable(string $api_key, string $base_url, array<string, string> $endpoints): Client */
-	private $client_factory;
 
 	/**
 	 * @param callable(string $api_key, string $base_url, array<string, string> $endpoints): Client $client_factory
@@ -117,20 +114,6 @@ class AutomationsEndpoint {
 				),
 			)
 		);
-	}
-
-	/**
-	 * @return bool|WP_Error
-	 */
-	public function permission_check( WP_REST_Request $request ) {
-		if ( ! current_user_can( Constants::CAPABILITY ) ) {
-			return new WP_Error(
-				'smaily_connect_forbidden',
-				__( 'You do not have permission to manage Campaign Intelligence.', 'smaily-connect' ),
-				array( 'status' => 403 )
-			);
-		}
-		return true;
 	}
 
 	public function catalog( WP_REST_Request $request ): WP_REST_Response {
@@ -186,10 +169,17 @@ class AutomationsEndpoint {
 		// The plugin never sends `test_mode: false` (CON-172). It never
 		// switches real sends on (§13) — only the go-live action (§20) or a
 		// Smaily operator does — and a left-out key keeps the stored value.
+		//
+		// A cleared workflow goes out as `{}` (CON-180). WP REST decodes the
+		// browser's `{}` into an empty PHP array, which would re-encode as
+		// the JSON list `[]`; §13 types `automation_map` as an object.
 		$configs = array_map(
 			static function ( $row ) {
 				if ( is_array( $row ) && array_key_exists( 'test_mode', $row ) && $row['test_mode'] === false ) {
 					unset( $row['test_mode'] );
+				}
+				if ( is_array( $row ) && array_key_exists( 'automation_map', $row ) && $row['automation_map'] === array() ) {
+					$row['automation_map'] = new \stdClass();
 				}
 				return $row;
 			},
@@ -245,14 +235,6 @@ class AutomationsEndpoint {
 		}
 
 		return null;
-	}
-
-	private function client(): Client {
-		return ( $this->client_factory )(
-			$this->settings->api_key(),
-			$this->settings->base_url(),
-			$this->settings->endpoints()
-		);
 	}
 
 	/**
