@@ -14,6 +14,7 @@ return array(
     'Smaily\\Connect\\DB\\QueueJanitor' => $baseDir . '/includes/DB/QueueJanitor.php',
     'Smaily\\Connect\\Deactivation' => $baseDir . '/includes/Deactivation.php',
     'Smaily\\Connect\\Integrations\\Elementor\\FormSubscription' => $baseDir . '/includes/Integrations/Elementor/FormSubscription.php',
+    'Smaily\\Connect\\Integrations\\WooCommerce\\AutomationDiscount' => $baseDir . '/includes/Integrations/WooCommerce/AutomationDiscount.php',
     'Smaily\\Connect\\Integrations\\WooCommerce\\CartHookHandler' => $baseDir . '/includes/Integrations/WooCommerce/CartHookHandler.php',
     'Smaily\\Connect\\Integrations\\WooCommerce\\CatalogHookHandler' => $baseDir . '/includes/Integrations/WooCommerce/CatalogHookHandler.php',
     'Smaily\\Connect\\Integrations\\WooCommerce\\CustomerHookHandler' => $baseDir . '/includes/Integrations/WooCommerce/CustomerHookHandler.php',
@@ -73,6 +74,7 @@ return array(
     'Smaily\\Connect\\Smaily\\ContactAudience' => $baseDir . '/includes/Smaily/ContactAudience.php',
     'Smaily\\Connect\\Smaily\\ContactReconciler' => $baseDir . '/includes/Smaily/ContactReconciler.php',
     'Smaily\\Connect\\Smaily\\ContactSyncMode' => $baseDir . '/includes/Smaily/ContactSyncMode.php',
+    'Smaily\\Connect\\Smaily\\DiscountCodeIssuer' => $baseDir . '/includes/Smaily/DiscountCodeIssuer.php',
     'Smaily\\Connect\\Smaily\\EventQueue' => $baseDir . '/includes/Smaily/EventQueue.php',
     'Smaily\\Connect\\Smaily\\Flusher' => $baseDir . '/includes/Smaily/Flusher.php',
     'Smaily\\Connect\\Smaily\\ProductMatrixBuilder' => $baseDir . '/includes/Smaily/ProductMatrixBuilder.php',
@@ -115,6 +117,7 @@ return array(
     'Smaily\\Connect\\Support\\ContactLanguageResolver' => $baseDir . '/includes/Support/ContactLanguageResolver.php',
     'Smaily\\Connect\\Support\\DebugLog' => $baseDir . '/includes/Support/DebugLog.php',
     'Smaily\\Connect\\Support\\MarketingConsent' => $baseDir . '/includes/Support/MarketingConsent.php',
+    'Smaily\\Connect\\Support\\NumberInput' => $baseDir . '/includes/Support/NumberInput.php',
     'Smaily\\Connect\\Support\\UpgradeLock' => $baseDir . '/includes/Support/UpgradeLock.php',
     'Smaily\\Connect\\Wizard\\EnvDetector' => $baseDir . '/includes/Wizard/EnvDetector.php',
 );

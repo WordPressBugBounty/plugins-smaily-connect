@@ -13,6 +13,7 @@ defined( 'ABSPATH' ) || exit;
 
 // phpcs:disable WordPress.Security.EscapeOutput.ExceptionNotEscaped -- exception messages are captured to the Event Log / returned to admin-only read models, never echoed to a browser; output-escaping does not apply.
 
+use Smaily\Connect\Integrations\WooCommerce\AutomationDiscount;
 use Smaily\Connect\Integrations\WooCommerce\HookHandler;
 
 /**
@@ -61,6 +62,12 @@ use Smaily\Connect\Integrations\WooCommerce\HookHandler;
  *     429) fails the row at once, anything else (incl. a transient Smaily
  *     body code) is retried with backoff until the attempt ceiling
  *     (PRO-1685)
+ *
+ * A welcome or first-order email whose "Send a discount code" is on gets
+ * the shopper's code just before the post, once the workflow is found
+ * (AutomationDiscount, CON-199): a retry posts the code its first attempt
+ * made, and an email sent without one keeps the reason as the exchange's
+ * `note` in the Event Log.
  */
 final class Flusher {
 
@@ -93,13 +100,17 @@ final class Flusher {
 	 */
 	private ?string $skip_note = null;
 
+	/** The automations' discount codes (CON-199). */
+	private DiscountCodeIssuer $discount_codes;
+
 	/**
 	 * @param callable(string $account_key): Client $client_factory
 	 */
-	public function __construct( EventQueue $queue, AutomationRouter $router, callable $client_factory ) {
+	public function __construct( EventQueue $queue, AutomationRouter $router, callable $client_factory, AutomationDiscount $discounts ) {
 		$this->queue          = $queue;
 		$this->router         = $router;
 		$this->client_factory = $client_factory;
+		$this->discount_codes = new DiscountCodeIssuer( $queue, $discounts );
 	}
 
 	/**
@@ -131,7 +142,7 @@ final class Flusher {
 
 			try {
 				$payload = $this->decode_payload( (string) ( $event['payload'] ?? '' ) );
-				$this->dispatch( $type, $payload );
+				$this->dispatch( $id, $type, $payload );
 
 				// An HTTP 200 can still carry a refusal in Smaily's body code —
 				// fail or retry it by the code, never mark it sent (PRO-3862).
@@ -162,7 +173,7 @@ final class Flusher {
 	 * @throws TerminalDispatchException Unknown event type.
 	 * @throws ApiException              Transient API failure — should be retried.
 	 */
-	private function dispatch( string $event_type, array $payload ): void {
+	private function dispatch( int $id, string $event_type, array $payload ): void {
 		$email = isset( $payload['email'] ) ? (string) $payload['email'] : '';
 		if ( $email === '' ) {
 			// Missing email — terminal skip; mark_sent path handles it
@@ -180,11 +191,11 @@ final class Flusher {
 				return;
 
 			case HookHandler::EVENT_AUTOMATION_WELCOME:
-				$this->dispatch_automation( 'welcome', $payload, $fields );
+				$this->dispatch_automation( $id, 'welcome', $payload, $fields );
 				return;
 
 			case HookHandler::EVENT_AUTOMATION_FIRST_ORDER:
-				$this->dispatch_automation( 'first_order', $payload, $fields );
+				$this->dispatch_automation( $id, 'first_order', $payload, $fields );
 				return;
 
 			// automation.abandoned_cart deliberately has NO case here: the
@@ -254,7 +265,7 @@ final class Flusher {
 	 * @param array<string, mixed> $payload
 	 * @param array<string, mixed> $fields
 	 */
-	private function dispatch_automation( string $trigger, array $payload, array $fields ): void {
+	private function dispatch_automation( int $id, string $trigger, array $payload, array $fields ): void {
 		$contact_data = array(
 			'email'    => (string) $payload['email'],
 			'language' => isset( $payload['language'] ) ? (string) $payload['language'] : '',
@@ -266,7 +277,12 @@ final class Flusher {
 		// has mark_sent semantics, which is what flush() does after
 		// dispatch() returns without throwing.
 		try {
-			$this->router->trigger_automation( $trigger, $contact_data, $fields );
+			$this->router->trigger_automation(
+				$trigger,
+				$contact_data,
+				$fields,
+				fn (): array => $this->discount_codes->fields( $id, $trigger, $payload )
+			);
 		} finally {
 			// null when the router short-circuited before any request (no
 			// workflow) — record_exchange() then stores a skip marker (F3-44).
@@ -300,6 +316,9 @@ final class Flusher {
 	 * or a purchase marker for an address Smaily does not have).
 	 */
 	private function record_exchange( int $id ): void {
+		// An email that went without its discount code says why (CON-199).
+		$response = $this->discount_codes->noted( $this->current_exchange['response'] ?? null );
+
 		if ( $this->current_exchange === null ) {
 			$this->queue->store_exchange(
 				$id,
@@ -314,8 +333,7 @@ final class Flusher {
 			return;
 		}
 
-		$request  = $this->current_exchange['request'] ?? null;
-		$response = $this->current_exchange['response'] ?? null;
+		$request = $this->current_exchange['request'] ?? null;
 		$this->queue->store_exchange( $id, $this->trim_json( $request ), $this->trim_json( $response ) );
 	}
 

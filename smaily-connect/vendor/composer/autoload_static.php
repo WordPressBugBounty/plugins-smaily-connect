@@ -29,6 +29,7 @@ class ComposerStaticInitc9bd3d1d72511ce8fa30a9390fed4aef
         'Smaily\\Connect\\DB\\QueueJanitor' => __DIR__ . '/../..' . '/includes/DB/QueueJanitor.php',
         'Smaily\\Connect\\Deactivation' => __DIR__ . '/../..' . '/includes/Deactivation.php',
         'Smaily\\Connect\\Integrations\\Elementor\\FormSubscription' => __DIR__ . '/../..' . '/includes/Integrations/Elementor/FormSubscription.php',
+        'Smaily\\Connect\\Integrations\\WooCommerce\\AutomationDiscount' => __DIR__ . '/../..' . '/includes/Integrations/WooCommerce/AutomationDiscount.php',
         'Smaily\\Connect\\Integrations\\WooCommerce\\CartHookHandler' => __DIR__ . '/../..' . '/includes/Integrations/WooCommerce/CartHookHandler.php',
         'Smaily\\Connect\\Integrations\\WooCommerce\\CatalogHookHandler' => __DIR__ . '/../..' . '/includes/Integrations/WooCommerce/CatalogHookHandler.php',
         'Smaily\\Connect\\Integrations\\WooCommerce\\CustomerHookHandler' => __DIR__ . '/../..' . '/includes/Integrations/WooCommerce/CustomerHookHandler.php',
@@ -88,6 +89,7 @@ class ComposerStaticInitc9bd3d1d72511ce8fa30a9390fed4aef
         'Smaily\\Connect\\Smaily\\ContactAudience' => __DIR__ . '/../..' . '/includes/Smaily/ContactAudience.php',
         'Smaily\\Connect\\Smaily\\ContactReconciler' => __DIR__ . '/../..' . '/includes/Smaily/ContactReconciler.php',
         'Smaily\\Connect\\Smaily\\ContactSyncMode' => __DIR__ . '/../..' . '/includes/Smaily/ContactSyncMode.php',
+        'Smaily\\Connect\\Smaily\\DiscountCodeIssuer' => __DIR__ . '/../..' . '/includes/Smaily/DiscountCodeIssuer.php',
         'Smaily\\Connect\\Smaily\\EventQueue' => __DIR__ . '/../..' . '/includes/Smaily/EventQueue.php',
         'Smaily\\Connect\\Smaily\\Flusher' => __DIR__ . '/../..' . '/includes/Smaily/Flusher.php',
         'Smaily\\Connect\\Smaily\\ProductMatrixBuilder' => __DIR__ . '/../..' . '/includes/Smaily/ProductMatrixBuilder.php',
@@ -130,6 +132,7 @@ class ComposerStaticInitc9bd3d1d72511ce8fa30a9390fed4aef
         'Smaily\\Connect\\Support\\ContactLanguageResolver' => __DIR__ . '/../..' . '/includes/Support/ContactLanguageResolver.php',
         'Smaily\\Connect\\Support\\DebugLog' => __DIR__ . '/../..' . '/includes/Support/DebugLog.php',
         'Smaily\\Connect\\Support\\MarketingConsent' => __DIR__ . '/../..' . '/includes/Support/MarketingConsent.php',
+        'Smaily\\Connect\\Support\\NumberInput' => __DIR__ . '/../..' . '/includes/Support/NumberInput.php',
         'Smaily\\Connect\\Support\\UpgradeLock' => __DIR__ . '/../..' . '/includes/Support/UpgradeLock.php',
         'Smaily\\Connect\\Wizard\\EnvDetector' => __DIR__ . '/../..' . '/includes/Wizard/EnvDetector.php',
     );

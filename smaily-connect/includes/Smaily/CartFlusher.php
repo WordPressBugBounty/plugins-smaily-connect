@@ -13,6 +13,7 @@ defined( 'ABSPATH' ) || exit;
 
 // phpcs:disable WordPress.Security.EscapeOutput.ExceptionNotEscaped -- exception messages are captured to the Event Log / debug log, never echoed to a browser.
 
+use Smaily\Connect\Integrations\WooCommerce\AutomationDiscount;
 use Smaily\Connect\Support\DebugLog;
 
 /**
@@ -54,6 +55,12 @@ use Smaily\Connect\Support\DebugLog;
  *     on any other Throwable (F3-53: a deterministic throw must never become
  *     an eternal retry loop; failed rows stay observable + manually
  *     retryable in the Event Log).
+ *
+ * A reminder whose "Send a discount code" is on gets the shopper's code just
+ * before the post, on either path, after the consent gate — a skipped
+ * reminder makes no code (AutomationDiscount, CON-199). A retry posts the
+ * code its first attempt made; a reminder sent without one keeps the reason
+ * as the exchange's `note`.
  *
  * Every row stores its send-time exchange per F3-44 (sent_payload +
  * last_response, NEVER the Authorization header — the Client captures the
@@ -99,13 +106,17 @@ class CartFlusher {
 	/** The contact-sync mode, read afresh for every flush (its own memo must not outlive one). */
 	private ?ContactSyncMode $mode = null;
 
+	/** The reminders' discount codes (CON-199). */
+	private DiscountCodeIssuer $discount_codes;
+
 	/**
 	 * @param callable(string $account_key): Client $client_factory
 	 */
-	public function __construct( EventQueue $queue, AutomationRouter $router, callable $client_factory ) {
+	public function __construct( EventQueue $queue, AutomationRouter $router, callable $client_factory, AutomationDiscount $discounts ) {
 		$this->queue          = $queue;
 		$this->router         = $router;
 		$this->client_factory = $client_factory;
+		$this->discount_codes = new DiscountCodeIssuer( $queue, $discounts );
 	}
 
 	/**
@@ -135,7 +146,7 @@ class CartFlusher {
 			try {
 				$payload = $this->decode_payload( (string) ( $event['payload'] ?? '' ) );
 
-				$skip = $this->dispatch( $payload );
+				$skip = $this->dispatch( $id, $payload );
 				if ( $skip !== '' ) {
 					// Closed for good with its reason; nothing was sent, so
 					// no exchange is stored over it (CON-196).
@@ -182,7 +193,7 @@ class CartFlusher {
 	 * @throws TerminalDispatchException Deterministic failure — never retried.
 	 * @throws ApiException              Transient API failure — retried.
 	 */
-	private function dispatch( array $payload ): string {
+	private function dispatch( int $id, array $payload ): string {
 		$email = isset( $payload['email'] ) ? (string) $payload['email'] : '';
 		if ( $email === '' ) {
 			// Terminal skip — the sweeper only enqueues rows with an email,
@@ -202,8 +213,10 @@ class CartFlusher {
 			'language' => isset( $payload['language'] ) ? (string) $payload['language'] : '',
 		);
 
+		$discount_fields = fn (): array => $this->discount_codes->fields( $id, 'abandoned_cart', $payload );
+
 		try {
-			if ( $this->router->trigger_automation( 'abandoned_cart', $contact, $fields ) ) {
+			if ( $this->router->trigger_automation( 'abandoned_cart', $contact, $fields, $discount_fields ) ) {
 				return '';
 			}
 		} finally {
@@ -226,7 +239,7 @@ class CartFlusher {
 			return '';
 		}
 
-		$address = array_merge( array( 'email' => $email ), $fields );
+		$address = array_merge( array( 'email' => $email ), $fields, $discount_fields() );
 
 		$client = ( $this->client_factory )( 'default' );
 		try {
@@ -322,6 +335,9 @@ class CartFlusher {
 	 * Smaily reply, or a "skipped" marker when nothing was POSTed.
 	 */
 	private function record_exchange( int $id ): void {
+		// A reminder that went without its discount code says why (CON-199).
+		$response = $this->discount_codes->noted( $this->current_exchange['response'] ?? null );
+
 		if ( $this->current_exchange === null ) {
 			$this->queue->store_exchange(
 				$id,
@@ -336,8 +352,7 @@ class CartFlusher {
 			return;
 		}
 
-		$request  = $this->current_exchange['request'] ?? null;
-		$response = $this->current_exchange['response'] ?? null;
+		$request = $this->current_exchange['request'] ?? null;
 		$this->queue->store_exchange( $id, $this->trim_json( $request ), $this->trim_json( $response ) );
 	}
 
