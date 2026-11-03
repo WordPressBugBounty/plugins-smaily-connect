@@ -14,20 +14,20 @@ defined( 'ABSPATH' ) || exit;
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.PreparedSQLPlaceholders.UnquotedComplexPlaceholder, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Custom plugin tables: interpolated values are $wpdb->prepare()d (dynamic IN() lists build placeholder strings); object-cache is N/A for a write-through queue / cleanup / DDL path.
 
 use Automattic\WooCommerce\Utilities\OrderUtil;
+use Smaily\Connect\Smaily\RecEngine\HistoryConfig;
 use Smaily\Connect\Smaily\RecEngine\IngestQueue;
 use Smaily\Connect\Smaily\RecEngine\OrderFlusher;
 use Smaily\Connect\Smaily\RecEngine\OrderPayloadBuilder;
 
 /**
- * Two things make orders different from catalog/customers:
+ * Three things make orders different from catalog/customers:
  *
  *   1. HPOS. Orders live in `wp_posts` (legacy) OR the `wc_orders` custom table
  *      (HPOS), depending on the store's order-storage mode. `wc_get_orders()`
  *      is storage-agnostic but offers only offset/paged pagination, which
  *      SHIFTS under concurrent inserts and would break the resumable cursor —
- *      so this enumerates with a direct `WHERE id > cursor` query against
- *      whichever table is active (detected via OrderUtil, like EnvDetector).
- *      Pilot stores (WC 6.9.4) are legacy; the HPOS path is forward-compat.
+ *      so this enumerates with a direct keyset query against whichever table
+ *      is active (table_spec(), detected via OrderUtil, like EnvDetector).
  *
  *   2. Status filter. The live OrderHookHandler enqueues every status EXCEPT the
  *      non-sale ones (map_status() returns '' only for NON_SALE_STATUSES; custom
@@ -37,11 +37,34 @@ use Smaily\Connect\Smaily\RecEngine\OrderPayloadBuilder;
  *      source so the denylist can't drift from map_status(). The flusher's own
  *      map_status==='' skip stays as the safety net for any non-sale status the
  *      SQL prefixing doesn't catch.
+ *
+ *   3. History window (contract v1.20.0 §5, §25 — the Magento extension's
+ *      rule, CON-245). start() reads the engine's `config.history`
+ *      (HistoryConfig) and fixes the window: `until` = now (an order placed
+ *      later goes through the live sync), `start_from` = start_months back,
+ *      `horizon` = horizon_months back. Orders go newest first by order date
+ *      (table_spec()'s `created_col`, then id): the start part down to
+ *      `start_from`, then the background part down to `horizon`; no older
+ *      order is read. The window and the `date|id` position of the last order
+ *      read are the job's cursor (JSON in `cursor_value`), so a resume goes on
+ *      at the next order. When the start part is read, `start_part_queued_to`
+ *      keeps the newest order.upsert queue row id, for the history progress
+ *      report.
  */
 class OrderBackfillJob extends AbstractBackfillJob {
 
-	public function __construct( IngestQueue $queue, OrderFlusher $flusher ) {
+	private HistoryConfig $history;
+
+	/**
+	 * The window initial_cursor() fixed, for count_total() in the same start().
+	 *
+	 * @var array{until: string, start_from: string, horizon: string, after: string, start_part_queued_to: int|null}|null
+	 */
+	private ?array $window = null;
+
+	public function __construct( IngestQueue $queue, OrderFlusher $flusher, HistoryConfig $history ) {
 		parent::__construct( $queue, $flusher );
+		$this->history = $history;
 	}
 
 	public function job_type(): string {
@@ -52,49 +75,112 @@ class OrderBackfillJob extends AbstractBackfillJob {
 		return 50; // Orders carry nested line items — the engine's lower cap.
 	}
 
+	protected function initial_cursor(): ?string {
+		$this->window = $this->new_window();
+		return (string) wp_json_encode( $this->window );
+	}
+
+	/** The sale orders inside the window — the orders the walk reads. */
 	protected function count_total(): int {
-		global $wpdb;
-		$spec         = self::table_spec( self::uses_hpos(), $wpdb->prefix );
-		$statuses     = $this->non_sale_status_slugs();
-		$placeholders = implode( ', ', array_fill( 0, count( $statuses ), '%s' ) );
-
-		$sql  = "SELECT COUNT(*) FROM {$spec['table']} WHERE {$spec['type_col']} = %s AND {$spec['status_col']} NOT IN ( {$placeholders} )";
-		$args = array_merge( array( 'shop_order' ), $statuses );
-
-		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		return (int) $wpdb->get_var( $wpdb->prepare( $sql, $args ) );
-		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$window = $this->window ?? $this->new_window();
+		return self::count_orders( $window['horizon'], $window['until'] );
 	}
 
 	/**
-	 * @return int[]
+	 * The sale orders placed from $from to $until (UTC) — the orders the walk
+	 * reads in that span. Also the §25 progress report's start part total
+	 * (HistoryProgress, CON-248).
 	 */
-	protected function fetch_ids_after( int $after_id, int $limit ): array {
+	public static function count_orders( string $from, string $until ): int {
 		global $wpdb;
-		$spec         = self::table_spec( self::uses_hpos(), $wpdb->prefix );
-		$statuses     = $this->non_sale_status_slugs();
-		$placeholders = implode( ', ', array_fill( 0, count( $statuses ), '%s' ) );
+		$spec                 = self::table_spec( self::uses_hpos(), $wpdb->prefix );
+		list( $where, $args ) = self::sale_orders_where( $spec, $from, $until );
 
-		$sql  = "SELECT {$spec['id_col']} FROM {$spec['table']} WHERE {$spec['type_col']} = %s AND {$spec['status_col']} NOT IN ( {$placeholders} ) AND {$spec['id_col']} > %d ORDER BY {$spec['id_col']} ASC LIMIT %d";
-		$args = array_merge( array( 'shop_order' ), $statuses, array( $after_id, $limit ) );
+		// The placeholders are in $where (sale_orders_where()).
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+		return (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$spec['table']} WHERE {$where}", $args ) );
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+	}
 
-		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$ids = $wpdb->get_col( $wpdb->prepare( $sql, $args ) );
-		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	/**
+	 * The distinct buyers with a purchase order placed from $from to $until
+	 * (UTC) — contract §25 `entities.buyers.expected`: `completed` or
+	 * `processing`, so the sale orders less the cancelled and refunded ones.
+	 * Counted by billing email, so a guest buyer counts too (the Magento
+	 * extension counts the same way). The query returns one number; no
+	 * address leaves the database.
+	 */
+	public static function count_buyers( string $from, string $until ): int {
+		global $wpdb;
+		$hpos     = self::uses_hpos();
+		$spec     = self::table_spec( $hpos, $wpdb->prefix );
+		$statuses = array_merge( self::non_sale_status_slugs(), array( 'wc-cancelled', 'wc-refunded' ) );
+		$in       = implode( ', ', array_fill( 0, count( $statuses ), '%s' ) );
+		$args     = array_merge( array( 'shop_order' ), $statuses, array( $from, $until ) );
+		$where    = "o.{$spec['type_col']} = %s AND o.{$spec['status_col']} NOT IN ( {$in} ) AND o.{$spec['created_col']} >= %s AND o.{$spec['created_col']} <= %s";
 
-		return array_map( 'intval', $ids );
+		if ( $hpos ) {
+			$sql = "SELECT COUNT( DISTINCT o.billing_email ) FROM {$spec['table']} o WHERE {$where} AND o.billing_email <> ''";
+		} else {
+			$sql = "SELECT COUNT( DISTINCT pm.meta_value ) FROM {$spec['table']} o INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = o.{$spec['id_col']} AND pm.meta_key = '_billing_email' WHERE {$where} AND pm.meta_value <> ''";
+		}
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+		return (int) $wpdb->get_var( $wpdb->prepare( $sql, $args ) );
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+	}
+
+	/**
+	 * The start part first, then the background part, newest first. A cursor
+	 * of an earlier version (a bare order id) gets a window now and starts
+	 * from the newest order again; the engine updates an order it already has.
+	 *
+	 * @return array{ids: int[], cursor: string, completed: bool}
+	 */
+	protected function next_page( string $cursor, int $limit ): array {
+		$window = self::decode_window( $cursor ) ?? $this->new_window();
+
+		if ( $window['start_part_queued_to'] === null ) {
+			$rows = $this->page( $window['start_from'], $window, $limit );
+			if ( $rows !== array() ) {
+				return self::after_page( $window, $rows, false );
+			}
+			$window['start_part_queued_to'] = $this->queue->last_id( OrderFlusher::EVENT_ORDER_UPSERT );
+		}
+
+		$rows = $this->page( $window['horizon'], $window, $limit );
+		return self::after_page( $window, $rows, count( $rows ) < $limit );
+	}
+
+	/**
+	 * The window of an import that starts at $now (UTC). A day the earlier
+	 * month lacks rolls forward (31 August − 6 months is 3 March).
+	 *
+	 * @param array{start_months: int, horizon_months: int, order: string} $history
+	 * @return array{until: string, start_from: string, horizon: string, after: string, start_part_queued_to: int|null}
+	 */
+	public static function window( array $history, int $now ): array {
+		$at = new \DateTimeImmutable( '@' . $now );
+		return array(
+			'until'                => $at->format( 'Y-m-d H:i:s' ),
+			'start_from'           => $at->sub( new \DateInterval( 'P' . $history['start_months'] . 'M' ) )->format( 'Y-m-d H:i:s' ),
+			'horizon'              => $at->sub( new \DateInterval( 'P' . $history['horizon_months'] . 'M' ) )->format( 'Y-m-d H:i:s' ),
+			'after'                => '',
+			'start_part_queued_to' => null,
+		);
 	}
 
 	/**
 	 * The order table + its id/type/status columns for the active storage mode.
-	 * PURE (no DB) so the HPOS path is unit-testable without a wc_orders table —
-	 * the pilot runs legacy, so the HPOS path is forward-compat and verified by
-	 * its column mapping here, not by an integration query (STATUS/CLAUDE).
+	 * PURE (no DB) so both mappings are unit-pinned; CI also runs the
+	 * integration suite on both storages (PRO-3435).
 	 *
 	 * `modified_col` is the order's last-changed time in UTC — read by the
 	 * transactional status line's recent-orders lookup (PRO-4091).
+	 * `created_col` is the order date in UTC — the order the import walks in
+	 * and its history window (CON-245).
 	 *
-	 * @return array{table: string, id_col: string, type_col: string, status_col: string, modified_col: string}
+	 * @return array{table: string, id_col: string, type_col: string, status_col: string, modified_col: string, created_col: string}
 	 */
 	public static function table_spec( bool $hpos, string $prefix ): array {
 		if ( $hpos ) {
@@ -104,6 +190,7 @@ class OrderBackfillJob extends AbstractBackfillJob {
 				'type_col'     => 'type',
 				'status_col'   => 'status',
 				'modified_col' => 'date_updated_gmt',
+				'created_col'  => 'date_created_gmt',
 			);
 		}
 		return array(
@@ -112,6 +199,7 @@ class OrderBackfillJob extends AbstractBackfillJob {
 			'type_col'     => 'post_type',
 			'status_col'   => 'post_status',
 			'modified_col' => 'post_modified_gmt',
+			'created_col'  => 'post_date_gmt',
 		);
 	}
 
@@ -137,10 +225,114 @@ class OrderBackfillJob extends AbstractBackfillJob {
 		$this->queue->enqueue(
 			OrderFlusher::EVENT_ORDER_UPSERT,
 			(string) $entity_id,
-			array(),
+			$this->import_payload(),
 			null,
 			OrderFlusher::FLUSH_HOOK,
 			OrderFlusher::AS_GROUP
+		);
+	}
+
+	/**
+	 * @return array{until: string, start_from: string, horizon: string, after: string, start_part_queued_to: int|null}
+	 */
+	private function new_window(): array {
+		return self::window( $this->history->for_new_import(), time() );
+	}
+
+	/**
+	 * A cursor this class wrote, or null. Public for the history progress
+	 * report (HistoryProgress, CON-248): the window, the position read and
+	 * where the start part ends.
+	 *
+	 * @return array{until: string, start_from: string, horizon: string, after: string, start_part_queued_to: int|null}|null
+	 */
+	public static function decode_window( string $cursor ): ?array {
+		$window = json_decode( $cursor, true );
+		if ( ! is_array( $window ) ) {
+			return null;
+		}
+		foreach ( array( 'until', 'start_from', 'horizon', 'after' ) as $key ) {
+			if ( ! is_string( $window[ $key ] ?? null ) ) {
+				return null;
+			}
+		}
+		$queued_to = $window['start_part_queued_to'] ?? null;
+
+		return array(
+			'until'                => $window['until'],
+			'start_from'           => $window['start_from'],
+			'horizon'              => $window['horizon'],
+			'after'                => $window['after'],
+			'start_part_queued_to' => is_int( $queued_to ) ? $queued_to : null,
+		);
+	}
+
+	/**
+	 * The page's ids, and the cursor at its last order.
+	 *
+	 * @param array{until: string, start_from: string, horizon: string, after: string, start_part_queued_to: int|null} $window
+	 * @param array<int, array{id: string, created: string}>                                                           $rows
+	 * @return array{ids: int[], cursor: string, completed: bool}
+	 */
+	private static function after_page( array $window, array $rows, bool $completed ): array {
+		$last = end( $rows );
+		if ( $last !== false ) {
+			$window['after'] = $last['created'] . '|' . $last['id'];
+		}
+
+		return array(
+			'ids'       => array_map( 'intval', array_column( $rows, 'id' ) ),
+			'cursor'    => (string) wp_json_encode( $window ),
+			'completed' => $completed,
+		);
+	}
+
+	/**
+	 * Up to $limit sale orders placed from $from to the window's `until` and
+	 * after its cursor position (`date|id`), newest first.
+	 *
+	 * @param array{until: string, start_from: string, horizon: string, after: string, start_part_queued_to: int|null} $window
+	 * @return array<int, array{id: string, created: string}>
+	 */
+	private function page( string $from, array $window, int $limit ): array {
+		global $wpdb;
+		$spec                 = self::table_spec( self::uses_hpos(), $wpdb->prefix );
+		list( $where, $args ) = self::sale_orders_where( $spec, $from, $window['until'] );
+
+		$position = explode( '|', $window['after'] );
+		if ( count( $position ) === 2 ) {
+			$where .= " AND ( {$spec['created_col']} < %s OR ( {$spec['created_col']} = %s AND {$spec['id_col']} < %d ) )";
+			$args   = array_merge( $args, array( $position[0], $position[0], (int) $position[1] ) );
+		}
+		$args[] = $limit;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT {$spec['id_col']} AS id, {$spec['created_col']} AS created FROM {$spec['table']} WHERE {$where} ORDER BY {$spec['created_col']} DESC, {$spec['id_col']} DESC LIMIT %d",
+				$args
+			),
+			ARRAY_A
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * The WHERE clause of the sale orders placed from $from to $until, and its
+	 * arguments.
+	 *
+	 * @param array{table: string, id_col: string, type_col: string, status_col: string, modified_col: string, created_col: string} $spec
+	 * @return array{0: string, 1: array<int, string|int>}
+	 */
+	private static function sale_orders_where( array $spec, string $from, string $until ): array {
+		$statuses     = self::non_sale_status_slugs();
+		$placeholders = implode( ', ', array_fill( 0, count( $statuses ), '%s' ) );
+
+		return array(
+			"{$spec['type_col']} = %s AND {$spec['status_col']} NOT IN ( {$placeholders} ) AND {$spec['created_col']} >= %s AND {$spec['created_col']} <= %s",
+			array_merge( array( 'shop_order' ), $statuses, array( $from, $until ) ),
 		);
 	}
 
@@ -150,10 +342,12 @@ class OrderBackfillJob extends AbstractBackfillJob {
 	 * (OrderPayloadBuilder::non_sale_wc_statuses). WC order statuses are stored
 	 * WITH the `wc-` prefix; WP core post statuses (draft / auto-draft / trash)
 	 * are stored WITHOUT it — prefix only the WC ones so both forms match.
+	 * Public for the customer scope's buyer query (CustomerScope, CON-246),
+	 * which must read the same sale orders as this import.
 	 *
 	 * @return string[]
 	 */
-	private function non_sale_status_slugs(): array {
+	public static function non_sale_status_slugs(): array {
 		$wp_core = array( 'draft', 'auto-draft', 'trash' );
 		return array_map(
 			static function ( string $status ) use ( $wp_core ): string {

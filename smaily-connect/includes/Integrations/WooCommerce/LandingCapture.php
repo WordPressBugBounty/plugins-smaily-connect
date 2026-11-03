@@ -64,9 +64,9 @@ use Smaily\Connect\Support\DebugLog;
 class LandingCapture {
 
 	/** URL params the engine link carries (re: lib/sync/url-builder.ts). */
-	public const URL_PARAM_REC_ID   = 'smaily_rec';
-	private const URL_PARAM_VISITOR = 'smaily_vt';
-	public const URL_PARAM_CONTEXT  = 'smaily_ctx';
+	public const URL_PARAM_REC_ID  = 'smaily_rec';
+	public const URL_PARAM_VISITOR = 'smaily_vt';
+	public const URL_PARAM_CONTEXT = 'smaily_ctx';
 
 	/** The generic UTM the engine ALSO sets (utm_content = rec_id) + its source guard. */
 	private const UTM_CONTENT       = 'utm_content';
@@ -105,6 +105,19 @@ class LandingCapture {
 			return;
 		}
 
+		$this->store( $get );
+	}
+
+	/**
+	 * Write the attribution cookies the given params resolve to (resolve()'s
+	 * rules), behind the same gates for every caller: the landing request
+	 * itself (capture()) and the `/land` route the storefront scripts post a
+	 * cached landing's values to (LandEndpoint, CON-250).
+	 *
+	 * @param array<string, mixed> $params Raw params, keyed by the link's own param names.
+	 * @return array<int, string> The slots written; empty when none was.
+	 */
+	public function store( array $params ): array {
 		/**
 		 * Master switch for server-side recommendation-attribution capture.
 		 * Return false to disable it entirely (e.g. a merchant whose consent
@@ -114,26 +127,26 @@ class LandingCapture {
 		 */
 		if ( ! (bool) apply_filters( 'smaily_connect_capture_attribution', true ) ) {
 			DebugLog::write( '[smaily-connect landing-capture] skipped: disabled by smaily_connect_capture_attribution filter' );
-			return;
+			return array();
 		}
 
 		// Only meaningful when the engine is connected: rec links exist only for a
 		// connected tenant, and orders are only ingested then.
 		if ( ! $this->settings->is_connected() ) {
 			DebugLog::write( '[smaily-connect landing-capture] bailed: rec-engine not connected (is_connected=false) — connect the engine in Settings → Campaign Intelligence' );
-			return;
+			return array();
 		}
 
 		// Cookies are response headers — once output has started we cannot set them.
 		if ( $this->headers_already_sent() ) {
 			DebugLog::write( '[smaily-connect landing-capture] bailed: headers already sent (a theme/plugin printed output before template_redirect)' );
-			return;
+			return array();
 		}
 
-		$captures = $this->resolve( $get );
+		$captures = $this->resolve( $params );
 		if ( array() === $captures ) {
 			DebugLog::write( '[smaily-connect landing-capture] bailed: a trigger param was present but no valid attribution value resolved (param shape mismatch?)' );
-			return;
+			return array();
 		}
 
 		$config = $this->settings->config();
@@ -148,6 +161,8 @@ class LandingCapture {
 		// The single success line: which signals were captured (no values — the
 		// rec_id is a uuid, but keep the log shape-only). Visible under WP_DEBUG.
 		DebugLog::write( sprintf( '[smaily-connect landing-capture] captured: %s', implode( ',', array_keys( $captures ) ) ) );
+
+		return array_keys( $captures );
 	}
 
 	/**
@@ -193,6 +208,34 @@ class LandingCapture {
 		);
 
 		return $token;
+	}
+
+	/**
+	 * Write the visitor token this browser already carries to the
+	 * visitor-token cookie again, with the same value and a fresh lifetime
+	 * from now (CON-251: a consenting customer's login renews it). The value
+	 * never changes; a value outside the token shape is not written.
+	 *
+	 * @return bool Whether the cookie was written ('' token, a value outside
+	 *              the token shape, or headers already sent: false).
+	 */
+	public function renew_visitor_token( string $token ): bool {
+		if ( ! AttributionShape::is_visitor_token( $token ) ) {
+			return false;
+		}
+		if ( $this->headers_already_sent() ) {
+			DebugLog::write( '[smaily-connect landing-capture] visitor token not renewed: headers already sent' );
+			return false;
+		}
+
+		$config = $this->settings->config();
+		$this->set_cookie(
+			$this->cookie_name( $config, self::SLOT_VISITOR ),
+			$token,
+			$this->cookie_ttl_days( $config, self::SLOT_VISITOR )
+		);
+
+		return true;
 	}
 
 	/**
@@ -334,12 +377,6 @@ class LandingCapture {
 	}
 
 	/**
-	 * The actual header write. Isolated so tests can capture the values without
-	 * emitting real Set-Cookie headers. Attributes mirror the contract
-	 * §"Cookie names" table + the JS capture: SameSite=Lax, Secure on https,
-	 * HttpOnly=false (the beacon proxy reads these cookies client-side).
-	 */
-	/**
 	 * Whether the response headers have already been sent (cookies can't be set
 	 * after that). A seam so tests can exercise the write path — PHPUnit's own
 	 * progress output makes the bare headers_sent() true mid-suite, which never
@@ -349,6 +386,15 @@ class LandingCapture {
 		return headers_sent();
 	}
 
+	/**
+	 * The actual header write. Isolated so tests can capture the values without
+	 * emitting real Set-Cookie headers. Attributes mirror the contract
+	 * §"Cookie names" table + the JS capture: SameSite=Lax, Secure on https,
+	 * HttpOnly=false. No storefront script reads these cookies (the visitor
+	 * token is read on the server, PRO-3860), but the scripts write them with
+	 * `document.cookie` when the `/land` request fails (CON-250), and a script
+	 * cannot replace an HttpOnly cookie.
+	 */
 	protected function send_cookie( string $name, string $value, int $expires ): void {
 		setcookie(
 			$name,

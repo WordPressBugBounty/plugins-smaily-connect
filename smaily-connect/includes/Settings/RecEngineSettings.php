@@ -13,6 +13,8 @@ defined( 'ABSPATH' ) || exit;
 
 use Smaily\Connect\Smaily\RecEngine\ApiException;
 use Smaily\Connect\Smaily\RecEngine\Client;
+use Smaily\Connect\Smaily\RecEngine\Backfill\HistoryProgress;
+use Smaily\Connect\Smaily\RecEngine\Backfill\ImportsOnConnect;
 use Smaily\Connect\Smaily\RecEngine\ExchangeResult;
 use Smaily\Connect\Support\DebugLog;
 use Throwable;
@@ -270,6 +272,12 @@ class RecEngineSettings {
 			self::OPTION_REFUSED_AT,
 			// The emails go back to their mapped workflows (CON-173).
 			EmailDesignWorkflows::OPTION,
+			// The imports this connection started one after another stop
+			// starting (CON-247); a new connection starts its own.
+			ImportsOnConnect::OPTION,
+			// Nothing more is reported for the history import this
+			// connection began (CON-248).
+			HistoryProgress::OPTION,
 		);
 		foreach ( $keys as $key ) {
 			delete_option( $key );

@@ -10,6 +10,8 @@ declare(strict_types=1);
 namespace Smaily\Connect\Smaily\RecEngine;
 
 use Smaily\Connect\Settings\RecEngineSettings;
+use Smaily\Connect\Smaily\RecEngine\Backfill\ImportPace;
+use Smaily\Connect\Smaily\RecEngine\Backfill\ImportRows;
 
 defined( 'ABSPATH' ) || exit;
 
@@ -25,7 +27,7 @@ defined( 'ABSPATH' ) || exit;
  *
  * Shared (here): the flush() skeleton (gate → drain → build → send → split),
  * the errors[].index → batch_rows[index] split, the
- * processed+deduplicated+errors==total invariant, and the ApiException
+ * processed+deduplicated+skipped+errors==total invariant, and the ApiException
  * terminal-4xx / transient-retry policy.
  *
  * Per-endpoint (subclass): event_types(), batch_size(), endpoint_label(),
@@ -102,11 +104,24 @@ abstract class AbstractD6Flusher {
 	}
 
 	/**
+	 * Rows of this flusher's event types still waiting to be sent — due now
+	 * or parked for a later retry. Read by an import run's backlog guard
+	 * (ImportPace::BACKLOG_ROWS, CON-236).
+	 */
+	public function backlog(): int {
+		return $this->queue->pending_count( $this->event_types() );
+	}
+
+	/**
 	 * Process up to $batch_size due rows (defaults to the endpoint's cap).
+	 *
+	 * An import run passes its $pace (CON-236): the request waits its turn,
+	 * and a request that fails as a whole ends the run (a 429 with the
+	 * engine's wait).
 	 *
 	 * @return array{processed: int, sent: int, failed: int, retried: int, skipped: int}
 	 */
-	public function flush( ?int $batch_size = null ): array {
+	public function flush( ?int $batch_size = null, ?ImportPace $pace = null ): array {
 		$stats = array(
 			'processed' => 0,
 			'sent'      => 0,
@@ -150,10 +165,17 @@ abstract class AbstractD6Flusher {
 			return $stats;
 		}
 
+		if ( $pace !== null ) {
+			$pace->await_turn();
+		}
+
 		try {
 			$response = $this->send( $objects );
 			$this->apply_response( $response, $batch_rows, $objects, $stats );
 		} catch ( ApiException $e ) {
+			if ( $pace !== null ) {
+				$pace->record_failure( $e );
+			}
 			$terminal = $this->is_terminal( $e );
 			foreach ( $batch_rows as $index => $row ) {
 				$this->handle_failure( $row, $objects[ $index ], $e, $terminal, $stats );
@@ -208,6 +230,8 @@ abstract class AbstractD6Flusher {
 			++$stats['failed'];
 		}
 
+		$skipped_index = $this->skipped_indexes( $response );
+		$accepted      = array();
 		foreach ( $batch_rows as $index => $row ) {
 			if ( isset( $failed_index[ $index ] ) ) {
 				continue;
@@ -216,34 +240,65 @@ abstract class AbstractD6Flusher {
 			$this->queue->mark_sent( $id );
 			$this->queue->store_exchange( $id, $this->trim_json( $objects[ $index ] ?? null ), $this->response_json( 200, 'accepted' ) );
 			++$stats['sent'];
+
+			// An import's row the engine stored counts on its run (CON-248);
+			// an order skipped as older than the horizon was not stored.
+			$mark = ImportRows::of( $row );
+			if ( $mark !== null && ! isset( $skipped_index[ $index ] ) ) {
+				$accepted[] = $mark;
+			}
 		}
+		ImportRows::record_accepted( $accepted );
 
 		$this->assert_invariant( $response, count( $batch_rows ), count( $errors ) );
 	}
 
 	/**
+	 * The batch indexes the engine answered 200 and did not store (contract
+	 * v1.20.0 §5 `skipped_orders[]`: an order older than the history horizon).
+	 * Absent when nothing was skipped.
+	 *
+	 * @param array<string, mixed> $response
+	 * @return array<int, true>
+	 */
+	private function skipped_indexes( array $response ): array {
+		$skipped = array();
+		foreach ( (array) ( $response['skipped_orders'] ?? array() ) as $entry ) {
+			if ( is_array( $entry ) && isset( $entry['index'] ) && is_numeric( $entry['index'] ) ) {
+				$skipped[ (int) $entry['index'] ] = true;
+			}
+		}
+
+		return $skipped;
+	}
+
+	/**
 	 * The engine's counts must reconcile with the batch size:
-	 * processed + deduplicated + errors.length == total. A mismatch is an
-	 * engine-side bug; log it (the row states already followed errors[], which
-	 * is authoritative).
+	 * processed + deduplicated + skipped + errors.length == total. `skipped`
+	 * (contract v1.20.0 §5) counts orders older than the history horizon that
+	 * the engine answered 200 and did not store; it is absent (= 0) when none
+	 * were. A mismatch is an engine-side bug; log it (the row states already
+	 * followed errors[], which is authoritative).
 	 *
 	 * @param array<string, mixed> $response
 	 */
 	private function assert_invariant( array $response, int $total, int $error_count ): void {
 		$processed    = isset( $response['processed'] ) ? (int) $response['processed'] : 0;
 		$deduplicated = isset( $response['deduplicated'] ) ? (int) $response['deduplicated'] : 0;
+		$skipped      = isset( $response['skipped'] ) ? (int) $response['skipped'] : 0;
 
-		if ( $processed + $deduplicated + $error_count === $total ) {
+		if ( $processed + $deduplicated + $skipped + $error_count === $total ) {
 			return;
 		}
 
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		\Smaily\Connect\Support\DebugLog::write(
 			sprintf(
-				'[smaily-connect] D6 invariant violation on %s ingest: processed(%d) + deduplicated(%d) + errors(%d) != batch(%d). Engine-side bug?',
+				'[smaily-connect] D6 invariant violation on %s ingest: processed(%d) + deduplicated(%d) + skipped(%d) + errors(%d) != batch(%d). Engine-side bug?',
 				$this->endpoint_label(),
 				$processed,
 				$deduplicated,
+				$skipped,
 				$error_count,
 				$total
 			)
@@ -280,7 +335,9 @@ abstract class AbstractD6Flusher {
 			return;
 		}
 
-		$this->queue->record_attempt( $id, $message, $this->backoff_seconds( $attempts + 1 ) );
+		// A 429 parks the row for at least the engine's wait (contract §2).
+		$retry_in = max( $this->backoff_seconds( $attempts + 1 ), $e->getCode() === 429 ? (int) $e->retry_after() : 0 );
+		$this->queue->record_attempt( $id, $message, $retry_in );
 		$this->queue->store_exchange( $id, $sent, $response );
 		++$stats['retried'];
 	}

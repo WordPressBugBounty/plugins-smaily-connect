@@ -225,6 +225,112 @@ class IngestQueue {
 		return $found !== null;
 	}
 
+	/**
+	 * How many rows of these event types still wait to be sent — due now or
+	 * parked for a later retry. The import run's backlog guard (CON-236).
+	 *
+	 * @param array<int, string> $event_types
+	 */
+	public function pending_count( array $event_types ): int {
+		global $wpdb;
+
+		if ( $event_types === array() ) {
+			return 0;
+		}
+
+		$table        = $this->table_name();
+		$placeholders = implode( ', ', array_fill( 0, count( $event_types ), '%s' ) );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+		$count = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(*) FROM {$table} WHERE status = %s AND event_type IN ( {$placeholders} )",
+				self::STATUS_PENDING,
+				...array_values( $event_types )
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+
+		return (int) $count;
+	}
+
+	/**
+	 * Is a row of this event type for this entity still pending (due or
+	 * retry-parked)? Lets a caller skip queuing a duplicate that the waiting
+	 * row will cover — the flusher builds both from current state at send.
+	 */
+	public function has_pending_for( string $event_type, string $entity_id ): bool {
+		global $wpdb;
+
+		$table = $this->table_name();
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
+		$found = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$table} WHERE status = %s AND event_type = %s AND entity_id = %s LIMIT 1",
+				self::STATUS_PENDING,
+				$event_type,
+				$entity_id
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
+
+		return $found !== null;
+	}
+
+	/**
+	 * Whether a row of these event types queued at or before $created_by
+	 * (UTC `Y-m-d H:i:s`) — or, with $max_id, a row with an id up to $max_id
+	 * — still waits to be sent, due now or parked for a retry. A row the
+	 * engine refused for good is `failed`, not pending, and does not count.
+	 * For the history progress report (CON-248): an import's rows are all in
+	 * once none of them waits.
+	 *
+	 * @param array<int, string> $event_types
+	 */
+	public function has_pending_before( array $event_types, ?string $created_by, ?int $max_id = null ): bool {
+		global $wpdb;
+
+		$table        = $this->table_name();
+		$placeholders = implode( ', ', array_fill( 0, count( $event_types ), '%s' ) );
+		$clause       = '';
+		$args         = array_merge( array( self::STATUS_PENDING ), array_values( $event_types ) );
+		if ( $created_by !== null ) {
+			$clause .= ' AND created_at <= %s';
+			$args[]  = $created_by;
+		}
+		if ( $max_id !== null ) {
+			$clause .= ' AND id <= %d';
+			$args[]  = $max_id;
+		}
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+		$found = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$table} WHERE status = %s AND event_type IN ( {$placeholders} ){$clause} LIMIT 1",
+				...$args
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+
+		return $found !== null;
+	}
+
+	/** The newest row id of an event type, 0 when it has none. */
+	public function last_id( string $event_type ): int {
+		global $wpdb;
+
+		$table = $this->table_name();
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
+		$id = $wpdb->get_var(
+			$wpdb->prepare( "SELECT MAX(id) FROM {$table} WHERE event_type = %s", $event_type )
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
+
+		return (int) $id;
+	}
+
 	public function mark_sent( int $id ): void {
 		global $wpdb;
 		$wpdb->update(

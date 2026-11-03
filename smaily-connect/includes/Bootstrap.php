@@ -26,6 +26,7 @@ use Smaily\Connect\Integrations\WooCommerce\OrderHookHandler;
 use Smaily\Connect\Integrations\WooCommerce\StorefrontBeacon;
 use Smaily\Connect\Integrations\WooCommerce\StorefrontRecommendations;
 use Smaily\Connect\Integrations\WooCommerce\TransactionalEmailHookHandler;
+use Smaily\Connect\DB\LegacyOrderDateIndex;
 use Smaily\Connect\DB\QueueJanitor;
 use Smaily\Connect\Notifications\NotificationManager;
 use Smaily\Connect\Privacy\GdprHandler;
@@ -52,6 +53,10 @@ use Smaily\Connect\Smaily\ContactReconciler;
 use Smaily\Connect\Smaily\RecEngine\Backfill\CatalogBackfillJob;
 use Smaily\Connect\Smaily\RecEngine\Backfill\CatalogImportOnConnect;
 use Smaily\Connect\Smaily\RecEngine\Backfill\CustomerBackfillJob;
+use Smaily\Connect\Smaily\RecEngine\Backfill\AbstractBackfillJob;
+use Smaily\Connect\Smaily\RecEngine\Backfill\HistoryProgress;
+use Smaily\Connect\Smaily\RecEngine\Backfill\ImportPace;
+use Smaily\Connect\Smaily\RecEngine\Backfill\ImportsOnConnect;
 use Smaily\Connect\Smaily\RecEngine\Backfill\OrderBackfillJob;
 use Smaily\Connect\Smaily\Client;
 use Smaily\Connect\Smaily\EventQueue;
@@ -62,8 +67,11 @@ use Smaily\Connect\Smaily\RecEngine\CatalogRemoveFlusher;
 use Smaily\Connect\Smaily\RecEngine\Client as RecEngineClient;
 use Smaily\Connect\Smaily\RecEngine\CustomerFlusher;
 use Smaily\Connect\Smaily\RecEngine\CustomerPayloadBuilder;
+use Smaily\Connect\Smaily\RecEngine\CustomerScope;
+use Smaily\Connect\Smaily\RecEngine\HistoryConfig;
 use Smaily\Connect\Smaily\RecEngine\IngestFlusher;
 use Smaily\Connect\Smaily\RecEngine\IngestQueue;
+use Smaily\Connect\Smaily\RecEngine\LoginMerge;
 use Smaily\Connect\Smaily\RecEngine\OrderFlusher;
 use Smaily\Connect\Smaily\RecEngine\OrderPayloadBuilder;
 use Smaily\Connect\Smaily\TransactionalFlusher;
@@ -224,6 +232,18 @@ final class Bootstrap {
 		// REST endpoints + the AS callback that drives the backfill loop.
 		add_action( 'rest_api_init', array( $this, 'register_rest_endpoints' ) );
 		add_action( BackfillJobInterface::TICK_HOOK, array( $this, 'on_backfill_tick' ), 10, 1 );
+		// The imports a connection starts one after another (CON-247): the
+		// check finds a part that stalled, and runs the one-time start after
+		// an update.
+		add_action( ImportsOnConnect::HOOK, array( $this, 'on_import_sequence_check' ) );
+		// The §25 history progress report (CON-248): its own action, so a
+		// slow or failed report never holds up an import batch.
+		add_action( HistoryProgress::HOOK, array( $this, 'on_history_progress' ) );
+		// The orders-import index on a legacy posts table (CON-259): added in
+		// this background action, never in the update or an admin request.
+		add_action( LegacyOrderDateIndex::HOOK, array( $this, 'on_order_date_index' ) );
+		// A login's §4 + §7 calls (CON-268): queued by the login, sent here.
+		add_action( LoginMerge::HOOK, array( $this, 'on_login_merge' ), 10, 5 );
 
 		// Storefront browse-beacon enqueue (3.4.3). wp_enqueue_scripts is a
 		// front-end-only hook; StorefrontBeacon::enqueue() self-gates on
@@ -316,11 +336,14 @@ final class Bootstrap {
 	}
 
 	/**
-	 * AS callback for BackfillJobInterface::TICK_HOOK. Processes one batch
-	 * (≤100 users by default per BackfillJob) and reschedules another
-	 * tick 30s out if the job hasn't reached its terminal state.
+	 * AS callback for BackfillJobInterface::TICK_HOOK. The contact import
+	 * processes one batch (≤100 users by default per BackfillJob); a Campaign
+	 * Intelligence import makes one run — batch after batch at ImportPace's
+	 * pace for up to its budget (CON-236). Either reschedules another tick if
+	 * the job hasn't reached its terminal state: 30 s out, or after the wait
+	 * an engine 429 asked for.
 	 *
-	 * @param string $job_type Currently only "contacts"; Phase 3 adds more.
+	 * @param string $job_type "contacts", "products", "customers" or "orders".
 	 */
 	public function on_backfill_tick( string $job_type = 'contacts' ): void {
 		$job = $this->make_backfill_job( $job_type );
@@ -329,18 +352,66 @@ final class Bootstrap {
 			return;
 		}
 
-		$result = $job->process_batch();
+		if ( $job instanceof AbstractBackfillJob ) {
+			$result   = $job->process_run();
+			$next_run = $result['next_run_in'];
+		} else {
+			$result   = $job->process_batch();
+			$next_run = ImportPace::NEXT_RUN_SECONDS;
+		}
 
 		// Reschedule until the job reaches its terminal state — each tick
 		// resumes from the saved cursor (resumable; never restarts).
 		if ( empty( $result['completed'] ) && function_exists( 'as_schedule_single_action' ) ) {
 			as_schedule_single_action(
-				time() + 30,
+				time() + $next_run,
 				BackfillJobInterface::TICK_HOOK,
 				array( 'job_type' => $job_type ),
 				EventQueue::AS_GROUP
 			);
+			return;
 		}
+
+		// A Campaign Intelligence import ended: the next import of the
+		// sequence a connection started begins now (CON-247).
+		if ( $job instanceof AbstractBackfillJob ) {
+			$this->imports_on_connect()->advance();
+		}
+	}
+
+	/**
+	 * AS callback for ImportsOnConnect::HOOK (CON-247).
+	 */
+	public function on_import_sequence_check(): void {
+		$this->imports_on_connect()->run_check();
+	}
+
+	/**
+	 * AS callback for HistoryProgress::HOOK (CON-248).
+	 */
+	public function on_history_progress(): void {
+		$this->history_progress()->run();
+	}
+
+	/**
+	 * AS callback for LegacyOrderDateIndex::HOOK (CON-259).
+	 */
+	public function on_order_date_index(): void {
+		( new LegacyOrderDateIndex() )->run();
+	}
+
+	/**
+	 * AS callback for LoginMerge::HOOK (CON-268). AS passes the args as
+	 * positional values (LoginMerge::args()).
+	 *
+	 * @param mixed $user_id         The WP user id.
+	 * @param mixed $token           The visitor token ('' = none).
+	 * @param mixed $anon_session_id The anon session id ('' = none).
+	 * @param mixed $consent         1 with a marketing yes at the login.
+	 * @param mixed $attempt         The run's number, from 1.
+	 */
+	public function on_login_merge( $user_id = 0, $token = '', $anon_session_id = '', $consent = 0, $attempt = 1 ): void {
+		$this->login_merge()->run( $user_id, $token, $anon_session_id, $consent, $attempt );
 	}
 
 	/**
@@ -358,15 +429,28 @@ final class Bootstrap {
 				}
 			case 'products': // 3.5.0 rec-engine catalog backfill.
 				return $this->catalog_backfill_job();
-			case 'customers': // 3.5.1 rec-engine customer backfill (A-filter).
+			case 'customers': // 3.5.1 rec-engine customer backfill (the §4 customer scope — CON-246).
+				// An import's own flusher sends with import_rec_client() (CON-236).
 				return new CustomerBackfillJob(
 					$this->ingest_queue(),
-					$this->customer_flusher()
+					new CustomerFlusher(
+						$this->ingest_queue(),
+						$this->customer_payload_builder(),
+						$this->rec_engine_settings(),
+						array( $this, 'import_rec_client' )
+					),
+					$this->customer_scope()
 				);
-			case 'orders': // 3.5.2 rec-engine order backfill (HPOS-aware, sale states).
+			case 'orders': // 3.5.2 rec-engine order backfill (HPOS-aware, sale states, newest first — CON-245).
 				return new OrderBackfillJob(
 					$this->ingest_queue(),
-					$this->order_flusher()
+					new OrderFlusher(
+						$this->ingest_queue(),
+						$this->order_payload_builder(),
+						$this->rec_engine_settings(),
+						array( $this, 'import_rec_client' )
+					),
+					$this->history_config()
 				);
 			default:
 				return null;
@@ -374,8 +458,70 @@ final class Bootstrap {
 	}
 
 	/**
-	 * The catalog import a successful setup exchange starts (PRO-3743), on the
-	 * same products job the "Import now" button starts.
+	 * Which registered users the engine gets as customers (contract §4,
+	 * CON-246) — shared by the customer import, the live customer sync and
+	 * the order hook's buyer row.
+	 */
+	public function customer_scope(): CustomerScope {
+		return new CustomerScope( $this->rec_engine_settings() );
+	}
+
+	/**
+	 * The engine's history window for an orders import (CON-245). The ping
+	 * makes one attempt: the merchant's Import now waits on it, and the
+	 * stored window is the answer when it fails.
+	 */
+	public function history_config(): HistoryConfig {
+		$bootstrap = $this;
+
+		return new HistoryConfig(
+			$this->rec_engine_settings(),
+			static function () use ( $bootstrap ): RecEngineClient {
+				return $bootstrap->rec_client( 1 );
+			}
+		);
+	}
+
+	/**
+	 * The imports a successful setup exchange starts, one after another —
+	 * products, customers, orders (CON-247) — on the same jobs the "Import
+	 * now" buttons start.
+	 */
+	public function imports_on_connect(): ImportsOnConnect {
+		$bootstrap = $this;
+
+		return new ImportsOnConnect(
+			$this->rec_engine_settings(),
+			static function ( string $job_type ) use ( $bootstrap ): ?AbstractBackfillJob {
+				$job = $bootstrap->make_backfill_job( $job_type );
+
+				return $job instanceof AbstractBackfillJob ? $job : null;
+			},
+			null,
+			$this->history_progress()
+		);
+	}
+
+	/**
+	 * Where the history import stands, for the engine's §25 progress report
+	 * and the Orders card (CON-248). The report makes one bounded attempt
+	 * (Client::history_progress()); a failure is retried 5 minutes later.
+	 */
+	public function history_progress(): HistoryProgress {
+		$bootstrap = $this;
+
+		return new HistoryProgress(
+			$this->rec_engine_settings(),
+			static function () use ( $bootstrap ): RecEngineClient {
+				return $bootstrap->rec_client( 1 );
+			},
+			$this->ingest_queue()
+		);
+	}
+
+	/**
+	 * The catalog import a successful setup exchange starts first (PRO-3743),
+	 * on the same products job the "Import now" button starts.
 	 */
 	public function catalog_import_on_connect(): CatalogImportOnConnect {
 		return new CatalogImportOnConnect( $this->catalog_backfill_job() );
@@ -386,9 +532,17 @@ final class Bootstrap {
 	 * two can never walk the catalog differently.
 	 */
 	public function catalog_backfill_job(): CatalogBackfillJob {
+		// Its own flusher: the import's requests are one short attempt
+		// (import_rec_client(), CON-236); the live catalog sync keeps
+		// ingest_flusher() and its retry.
 		return new CatalogBackfillJob(
 			$this->ingest_queue(),
-			$this->ingest_flusher(),
+			new IngestFlusher(
+				$this->ingest_queue(),
+				$this->catalog_payload_builder(),
+				$this->rec_engine_settings(),
+				array( $this, 'import_rec_client' )
+			),
 			$this->catalog_payload_builder(),
 			$this->multilingual_detector()
 		);
@@ -558,24 +712,30 @@ final class Bootstrap {
 		add_action( 'untrashed_post', array( $catalog, 'on_save_product' ), 10, 1 );
 
 		// Rec-engine customer ingest (Phase 3.3.3). Self-gates on
-		// is_connected() like catalog; enqueues every registered user
-		// (A-filter) on the §488 hook set, routed to the customer flusher.
+		// is_connected() like catalog; enqueues a user in the §4 customer
+		// scope (CON-246) on the §488 hook set + an opt-in meta change,
+		// routed to the customer flusher.
 		$customer = new CustomerHookHandler(
 			$this->ingest_queue(),
-			$this->rec_engine_settings()
+			$this->rec_engine_settings(),
+			$this->customer_scope()
 		);
 		add_action( 'user_register', array( $customer, 'on_user_register' ), 10, 1 );
 		add_action( 'profile_update', array( $customer, 'on_profile_update' ), 10, 1 );
 		add_action( 'woocommerce_created_customer', array( $customer, 'on_woocommerce_created_customer' ), 10, 1 );
 		add_action( 'woocommerce_save_account_details', array( $customer, 'on_save_account_details' ), 10, 1 );
+		add_action( 'added_user_meta', array( $customer, 'on_user_meta_changed' ), 10, 3 );
+		add_action( 'updated_user_meta', array( $customer, 'on_user_meta_changed' ), 10, 3 );
 
 		// Rec-engine order ingest (Phase 3.3-orders.3). Self-gates on
 		// is_connected(); enqueues on order-status changes whose mapped engine
-		// status changes to a confirmed purchase (OrderHookHandler).
+		// status changes to a confirmed purchase (OrderHookHandler), and the
+		// registered buyer's customer row once per order (CON-246).
 		$order = new OrderHookHandler(
 			$this->ingest_queue(),
 			$this->order_payload_builder(),
-			$this->rec_engine_settings()
+			$this->rec_engine_settings(),
+			$this->customer_scope()
 		);
 		add_action( 'woocommerce_order_status_changed', array( $order, 'on_order_status_changed' ), 10, 3 );
 		// A PARTIAL refund changes no status, so it needs its own hook to reach
@@ -602,13 +762,12 @@ final class Bootstrap {
 
 		// Rec-engine identity merge (3.7). On login, explicitly bind the
 		// anon-session cookies to the now-known customer (§7) — complementary to
-		// the engine's automatic browse-event retroactive binding (§6).
-		$bootstrap = $this;
-		$identity  = new IdentityHookHandler(
+		// the engine's automatic browse-event retroactive binding (§6). The login
+		// only queues the LoginMerge action; the action sends §4 and §7
+		// (CON-268), so a slow engine never holds a login.
+		$identity = new IdentityHookHandler(
 			$this->rec_engine_settings(),
-			static function () use ( $bootstrap ): RecEngineClient {
-				return $bootstrap->rec_client();
-			},
+			$this->login_merge(),
 			// (a).1: don't retroactively bind an opted-out contact's anon browse
 			// history — respect the profiling opt-out, even backwards.
 			$this->profiling_consent()
@@ -767,6 +926,24 @@ final class Bootstrap {
 			as_schedule_recurring_action( time(), DAY_IN_SECONDS, QueueJanitor::HOOK, array(), QueueJanitor::AS_GROUP );
 		}
 
+		// The imports a connection starts (CON-247): re-arm the sequence
+		// check after a reactivation, and arm the one-time start after an
+		// update. A single action, not a recurring one — it re-arms itself
+		// only while a sequence waits.
+		$this->imports_on_connect()->ensure_check_scheduled();
+
+		// The history progress report (CON-248): re-arm its check after a
+		// reactivation while an import is in progress. A single action that
+		// re-arms itself only while the import runs.
+		$this->history_progress()->ensure_scheduled();
+
+		// The orders-import index on a legacy posts table (CON-259): one
+		// single action while it is due — on a connected store on legacy
+		// storage only, and never again once it is added or has failed
+		// MAX_ATTEMPTS times. A store that switches from HPOS to legacy
+		// storage gets it within the hour; a connect schedules it at once.
+		( new LegacyOrderDateIndex() )->ensure_scheduled();
+
 		update_option( self::OPTION_AS_JOBS_VERIFIED, time(), false );
 	}
 
@@ -884,7 +1061,7 @@ final class Bootstrap {
 
 	public function workflow_resolver(): WorkflowResolverInterface {
 		if ( $this->resolver === null ) {
-			$this->resolver = new MultilingualRouter();
+			$this->resolver = new MultilingualRouter( null, $this->credentials() );
 		}
 
 		return $this->resolver;
@@ -1035,6 +1212,35 @@ final class Bootstrap {
 			$max_attempts,
 			$settings,
 			$timeout
+		);
+	}
+
+	/**
+	 * The engine client of a history import's sends (CON-236): ONE attempt of
+	 * at most ImportPace::REQUEST_TIMEOUT_SECONDS, so a run's last request
+	 * ends inside the time the run is given. A failed request is retried at
+	 * the row level (the queue's back-off), never inside the run.
+	 */
+	public function import_rec_client(): RecEngineClient {
+		return $this->rec_client( 1, ImportPace::REQUEST_TIMEOUT_SECONDS );
+	}
+
+	/**
+	 * The background action of a login's engine calls (CON-268): §4 with
+	 * marketing consent, then §7. Its client makes ONE attempt of at most
+	 * LoginMerge::TIMEOUT_SECONDS per request; a failure that may pass later
+	 * is queued again by the action itself, never waited out inside it.
+	 */
+	public function login_merge(): LoginMerge {
+		$bootstrap = $this;
+
+		return new LoginMerge(
+			$this->rec_engine_settings(),
+			static function () use ( $bootstrap ): RecEngineClient {
+				return $bootstrap->rec_client( 1, LoginMerge::TIMEOUT_SECONDS );
+			},
+			$this->customer_payload_builder(),
+			$this->profiling_consent()
 		);
 	}
 

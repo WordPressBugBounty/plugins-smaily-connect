@@ -30,15 +30,17 @@ defined( 'ABSPATH' ) || exit;
  * the real wp_remote_post body for each.
  *
  * Retry policy (RECENGINE_API_CONTRACT.md §6):
- *   - 429 + Retry-After header → respect the header (waiting at most
+ *   - 429 + `retry_after_seconds` (body) or Retry-After header → respect
+ *     it (waiting at most
  *     MAX_RETRY_AFTER_SECONDS, PRO-3817), exponential
  *     backoff (1s, 2s, 4s, 8s, 16s), max 5 attempts.
  *   - 5xx (500/502/503/504) → same backoff, max 5 attempts.
  *   - 4xx (non-429) → no retry, throw ApiException with the body's
  *     error_code so the caller can branch on `api_key_revoked` etc.
- *   - Exception: ingest_browse() (the storefront `/relay` forward) and
- *     store_uninstall() (Disconnect / uninstall, CON-219) make ONE short
- *     attempt and never retry or wait (PRO-3620).
+ *   - Exception: ingest_browse() (the storefront `/relay` forward),
+ *     store_uninstall() (Disconnect / uninstall, CON-219) and
+ *     console_entry() (the "Open Campaign Intelligence" button, CON-228)
+ *     make ONE short attempt and never retry or wait (PRO-3620).
  *
  * Version handling (contract §3): every response carries
  * `X-Engine-Version`. The client warns (error_log) on a major-version
@@ -130,6 +132,13 @@ class Client {
 	// Map key `store_uninstall`; a connection exchanged before v1.14.0 has no
 	// such key, so this fallback serves it.
 	public const PATH_STORE_UNINSTALL = '/api/v1/store/uninstall';
+	// §24 console entry (v1.19.0, CON-228). Map key `console_entry`, which the
+	// engine returns only while console entry is switched on.
+	public const PATH_CONSOLE_ENTRY = '/api/v1/console/entry';
+	// §25 history progress (v1.20.0, CON-248). Map key
+	// `ingest_history_progress`; a connection set up before v1.20.0 has no
+	// such key, so this fallback serves it.
+	public const PATH_INGEST_HISTORY_PROGRESS = '/api/v1/ingest/history/progress';
 
 	/** Default in-request retry ceiling — generous for one-shot calls (ping, setup). */
 	public const DEFAULT_MAX_ATTEMPTS = 5;
@@ -624,6 +633,47 @@ class Client {
 		return $this->request_url( 'POST', $this->resolve_url( 'store_uninstall', self::PATH_STORE_UNINSTALL ), null, true );
 	}
 
+	/**
+	 * A one-time link that opens the store's Campaign Intelligence console
+	 * (§24 console entry, CON-228) for the shop admin who pressed "Open
+	 * Campaign Intelligence". `$email` is that admin's own email, never a
+	 * customer's. The answer is `{url, expires_at}` for every valid request:
+	 * the console page, not the plugin, decides who gets in.
+	 *
+	 * The admin waits on it and each press must cost exactly one engine call,
+	 * so it is ONE attempt bounded by BROWSE_TIMEOUT_SECONDS, no redirect, no
+	 * retry and no Retry-After wait (as store_uninstall()). The link is never
+	 * stored or logged here.
+	 *
+	 * @return array<string, mixed> `{url, expires_at}`.
+	 *
+	 * @throws ApiException On 4xx (404 while console entry is off) / 5xx or network failure.
+	 */
+	public function console_entry( string $email ): array {
+		return $this->request_url( 'POST', $this->resolve_url( 'console_entry', self::PATH_CONSOLE_ENTRY ), array( 'email' => $email ), true );
+	}
+
+	/**
+	 * Report where the history import stands (§25 history progress,
+	 * CON-248): `{import_id, phase, horizon_start, entities}` — counts and
+	 * dates only, never a person's data.
+	 *
+	 * The report runs on its own Action Scheduler action and must never hold
+	 * up the import's batches queued behind it, so it is ONE attempt bounded
+	 * by BROWSE_TIMEOUT_SECONDS, no redirect, no retry and no Retry-After
+	 * wait. A failed report is tried again 5 minutes later by the caller
+	 * (HistoryProgress), with the counts of that moment.
+	 *
+	 * @param array<string, mixed> $body
+	 *
+	 * @return array<string, mixed> `{ok, stale, import_id, phase, start_part_complete_at, complete_at, history}`.
+	 *
+	 * @throws ApiException On 4xx/5xx or network failure.
+	 */
+	public function history_progress( array $body ): array {
+		return $this->request_url( 'POST', $this->resolve_url( 'ingest_history_progress', self::PATH_INGEST_HISTORY_PROGRESS ), $body, true );
+	}
+
 	// ---------------------------------------------------------------
 	// Private request engine.
 	// ---------------------------------------------------------------
@@ -693,7 +743,8 @@ class Client {
 	 * @param bool                      $single_attempt One attempt bounded by BROWSE_TIMEOUT_SECONDS,
 	 *                                                  no redirect, no retry and no Retry-After wait
 	 *                                                  (ingest_browse(), PRO-3620; store_uninstall(),
-	 *                                                  CON-219).
+	 *                                                  CON-219; console_entry(), CON-228;
+	 *                                                  history_progress(), CON-248).
 	 *
 	 * @return array<string, mixed>
 	 *
@@ -757,7 +808,7 @@ class Client {
 
 			$is_retryable = ( $status === 429 || ( $status >= 500 && $status < 600 ) );
 			if ( $is_retryable && $attempts < $max_attempts ) {
-				$retry_after = (int) wp_remote_retrieve_header( $response, 'retry-after' );
+				$retry_after = self::retry_after_of( $decoded, $response );
 				$sleep_for   = $retry_after > 0 ? min( $retry_after, self::MAX_RETRY_AFTER_SECONDS ) : $backoff;
 				$this->sleep_with_backoff( $sleep_for );
 				$backoff *= 2;
@@ -771,8 +822,27 @@ class Client {
 				$this->record_tenant_refusal( $error_code );
 			}
 
-			throw new ApiException( $status, $error_code, $message, $decoded );
+			$retry_after = $status === 429 ? self::retry_after_of( $decoded, $response ) : 0;
+
+			throw new ApiException( $status, $error_code, $message, $decoded, $retry_after > 0 ? $retry_after : null );
 		}
+	}
+
+	/**
+	 * The wait, in seconds, an engine answer asks for: the body's
+	 * `retry_after_seconds` (contract §2 — the engine's own field; it emits
+	 * no `Retry-After` header today), else the `Retry-After` header, else 0.
+	 *
+	 * @param array<string, mixed> $decoded  The decoded answer body.
+	 * @param array<string, mixed> $response The wp_remote_request() answer.
+	 */
+	private static function retry_after_of( array $decoded, array $response ): int {
+		$body = $decoded['retry_after_seconds'] ?? null;
+		if ( is_numeric( $body ) && (int) ceil( (float) $body ) > 0 ) {
+			return (int) ceil( (float) $body );
+		}
+
+		return max( 0, (int) wp_remote_retrieve_header( $response, 'retry-after' ) );
 	}
 
 	/**

@@ -12,11 +12,14 @@ namespace Smaily\Connect\REST;
 defined( 'ABSPATH' ) || exit;
 
 use Smaily\Connect\Bootstrap;
+use Smaily\Connect\DB\LegacyOrderDateIndex;
+use Smaily\Connect\Integrations\WooCommerce\LandingCapture;
 use Smaily\Connect\Integrations\WooCommerce\StorefrontRecommendations;
 use Smaily\Connect\Settings\EmailDesignWorkflows;
 use Smaily\Connect\Settings\RecEngineSettings;
 use Smaily\Connect\Smaily\BackfillJobInterface;
 use Smaily\Connect\Smaily\Client;
+use Smaily\Connect\Smaily\RecEngine\Backfill\ImportsOnConnect;
 use Smaily\Connect\Smaily\RecEngine\Client as RecEngineClient;
 use Smaily\Connect\Smaily\RecEngine\SetupExchange;
 use Smaily\Connect\Smaily\TransactionalResend;
@@ -71,6 +74,23 @@ final class EndpointRegistry {
 					// One dispatch for all job types (contacts + rec-engine),
 					// shared with Bootstrap::on_backfill_tick.
 					return $bootstrap->make_backfill_job( $job_type );
+				},
+				// A cancelled Campaign Intelligence import ends the imports a
+				// connection started one after another (CON-247).
+				static function (): void {
+					ImportsOnConnect::forget();
+				},
+				// The Orders card's Import now sends the order history again:
+				// a new §25 history import, begun before the run starts
+				// (CON-248). Products and Customers start none.
+				static function ( string $job_type ) use ( $bootstrap ): void {
+					if ( $job_type === 'orders' ) {
+						$bootstrap->history_progress()->begin( time() );
+					}
+				},
+				// The Orders card's bar for the part being sent (CON-248).
+				static function ( array $row ) use ( $bootstrap ): ?array {
+					return $bootstrap->history_progress()->card( $row );
 				}
 			),
 			new WorkflowsEndpoint(
@@ -103,10 +123,16 @@ final class EndpointRegistry {
 				static function ( string $api_key, string $base_url ): RecEngineClient {
 					return new RecEngineClient( $api_key, $base_url );
 				},
-				// Connecting starts the full catalog import (PRO-3743) through
-				// the same products job the "Import now" button starts.
+				// Connecting starts the catalog, customers and orders imports,
+				// one after another (CON-247; the catalog first, held back —
+				// PRO-3743), through the jobs the "Import now" buttons start.
+				// It also schedules the legacy posts-table index (CON-259) —
+				// only the action; the ALTER runs in the background, usually
+				// before the orders import reaches its first page.
 				static function () use ( $bootstrap ): bool {
-					return $bootstrap->catalog_import_on_connect()->start();
+					$started = $bootstrap->imports_on_connect()->start();
+					( new LegacyOrderDateIndex() )->ensure_scheduled();
+					return $started;
 				}
 			),
 			new AutomationsEndpoint(
@@ -128,6 +154,14 @@ final class EndpointRegistry {
 					return new RecEngineClient( $api_key, $base_url, $endpoints, 1 );
 				}
 			),
+			// "Open Campaign Intelligence" (CON-228, contract §24). One call
+			// per press: console_entry() is the Client's single-attempt mode.
+			new ConsoleEntryEndpoint(
+				new RecEngineSettings(),
+				static function ( string $api_key, string $base_url, array $endpoints ): RecEngineClient {
+					return new RecEngineClient( $api_key, $base_url, $endpoints, 1 );
+				}
+			),
 			new BeaconEndpoint(
 				new RecEngineSettings(),
 				static function ( string $api_key, string $base_url ): RecEngineClient {
@@ -142,6 +176,10 @@ final class EndpointRegistry {
 				static function () use ( $bootstrap ): StorefrontRecommendations {
 					return $bootstrap->storefront_recommendations();
 				}
+			),
+			new LandEndpoint(
+				new RecEngineSettings(),
+				new LandingCapture( new RecEngineSettings() )
 			),
 		);
 	}
@@ -238,6 +276,11 @@ final class EndpointRegistry {
 				'method' => 'POST',
 				'path'   => '/rec-engine/emails/design-link',
 			),
+			// "Open Campaign Intelligence" (CON-228, contract §24). POST only.
+			array(
+				'method' => 'POST',
+				'path'   => '/rec-engine/console-entry',
+			),
 			// The public browse-beacon proxy. Registered unconditionally; the
 			// gate (connected + browse-tracking on) lives in the handler, which
 			// 404s when disabled (BeaconEndpoint hard-gates before any work).
@@ -252,6 +295,12 @@ final class EndpointRegistry {
 			array(
 				'method' => 'GET',
 				'path'   => '/recommendations',
+			),
+			// The public campaign-click landing the storefront scripts post
+			// to, so the server sets the attribution cookies (CON-250).
+			array(
+				'method' => 'POST',
+				'path'   => '/land',
 			),
 		);
 	}
