@@ -144,8 +144,22 @@ abstract class AbstractD6Flusher {
 		$batch_rows = array();
 		foreach ( $rows as $row ) {
 			++$stats['processed'];
-			$id     = (int) ( $row['id'] ?? 0 );
-			$object = $this->row_to_object( $row );
+			$id = (int) ( $row['id'] ?? 0 );
+			try {
+				$object = $this->row_to_object( $row );
+			} catch ( \Throwable $e ) {
+				// A record whose payload cannot be built (its stored data
+				// throws) fails alone: the rest of the batch is sent, and an
+				// import or a live flush that meets it goes on (CON-302). Left
+				// pending, it would come first in every later flush of its
+				// event type and stop each one. Terminal — the same data throws
+				// again; Retry in the Event Log runs it again. The error type
+				// and where it was thrown, never its text (CON-301).
+				$this->queue->mark_failed( $id, \Smaily\Connect\Support\DebugLog::where( $e ) );
+				$this->queue->store_exchange( $id, null, (string) wp_json_encode( array( 'outcome' => 'not_built' ) ) );
+				++$stats['failed'];
+				continue;
+			}
 
 			if ( $object === null ) {
 				// Terminal skip — mark sent so the row leaves the queue. Record
@@ -306,12 +320,14 @@ abstract class AbstractD6Flusher {
 	}
 
 	/**
+	 * The row's last_error for an item the engine refused: the field it named,
+	 * never its message, which can name the customer (CON-301).
+	 *
 	 * @param array<string, mixed> $error A single errors[] entry.
 	 */
 	private function item_error_message( array $error ): string {
-		$field   = isset( $error['field'] ) ? (string) $error['field'] : '';
-		$message = isset( $error['message'] ) ? (string) $error['message'] : '';
-		return sprintf( 'd6_item_error field=%s: %s', $field, $message );
+		$field = isset( $error['field'] ) ? (string) $error['field'] : '';
+		return sprintf( 'd6_item_error field=%s', $field );
 	}
 
 	/**
@@ -394,9 +410,9 @@ abstract class AbstractD6Flusher {
 			'outcome' => $outcome,
 		);
 		if ( $error !== null ) {
+			// The field only, never the engine's message (CON-301).
 			$payload['error'] = array(
-				'field'   => isset( $error['field'] ) ? (string) $error['field'] : '',
-				'message' => isset( $error['message'] ) ? (string) $error['message'] : '',
+				'field' => isset( $error['field'] ) ? (string) $error['field'] : '',
 			);
 		}
 		return $this->trim_text( (string) wp_json_encode( $payload ) );

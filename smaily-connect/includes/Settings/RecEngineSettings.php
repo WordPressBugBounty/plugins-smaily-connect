@@ -17,6 +17,7 @@ use Smaily\Connect\Smaily\RecEngine\Backfill\HistoryProgress;
 use Smaily\Connect\Smaily\RecEngine\Backfill\ImportsOnConnect;
 use Smaily\Connect\Smaily\RecEngine\ExchangeResult;
 use Smaily\Connect\Support\DebugLog;
+use Smaily\Connect\Support\Url;
 use Throwable;
 
 /**
@@ -135,6 +136,14 @@ class RecEngineSettings {
 
 	public function base_url(): string {
 		return (string) get_option( self::OPTION_BASE_URL, '' );
+	}
+
+	/**
+	 * The stored engine's origin as a browser writes it
+	 * (`scheme://host[:port]`), or '' when no engine is stored.
+	 */
+	public function engine_origin(): string {
+		return Url::origin( $this->base_url() );
 	}
 
 	public function engine_version(): string {
@@ -275,6 +284,7 @@ class RecEngineSettings {
 			// The imports this connection started one after another stop
 			// starting (CON-247); a new connection starts its own.
 			ImportsOnConnect::OPTION,
+			ImportsOnConnect::OPTION_START_DUE,
 			// Nothing more is reported for the history import this
 			// connection began (CON-248).
 			HistoryProgress::OPTION,

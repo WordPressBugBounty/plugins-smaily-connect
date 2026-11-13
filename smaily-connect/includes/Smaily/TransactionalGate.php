@@ -216,6 +216,24 @@ class TransactionalGate {
 	}
 
 	/**
+	 * Order and shipping emails through the Transactional account are
+	 * switched on: the master switch and at least one trigger's toggle
+	 * (the installation report's `transactional_emails`, CON-290).
+	 */
+	public static function any_enabled(): bool {
+		if ( ! (bool) get_option( self::OPTION_ENABLED, false ) ) {
+			return false;
+		}
+		foreach ( self::TRIGGERS as $trigger ) {
+			if ( (bool) get_option( $trigger['toggle_option'], false ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
 	 * Whether a closed gate's $reason earns an Event Log skipped row
 	 * (PRO-4091). A switched-off email stays silent — a row per order on
 	 * every store that doesn't use it would flood the Event Log; a

@@ -74,6 +74,9 @@ class ComposerStaticInitc9bd3d1d72511ce8fa30a9390fed4aef
         'Smaily\\Connect\\REST\\SettingsEndpoint' => __DIR__ . '/../..' . '/includes/REST/SettingsEndpoint.php',
         'Smaily\\Connect\\REST\\TestConnectionEndpoint' => __DIR__ . '/../..' . '/includes/REST/TestConnectionEndpoint.php',
         'Smaily\\Connect\\REST\\WorkflowsEndpoint' => __DIR__ . '/../..' . '/includes/REST/WorkflowsEndpoint.php',
+        'Smaily\\Connect\\Report\\ConnectionHealth' => __DIR__ . '/../..' . '/includes/Report/ConnectionHealth.php',
+        'Smaily\\Connect\\Report\\InstallationReport' => __DIR__ . '/../..' . '/includes/Report/InstallationReport.php',
+        'Smaily\\Connect\\Report\\ReportBuilder' => __DIR__ . '/../..' . '/includes/Report/ReportBuilder.php',
         'Smaily\\Connect\\Settings\\CredentialSet' => __DIR__ . '/../..' . '/includes/Settings/CredentialSet.php',
         'Smaily\\Connect\\Settings\\Credentials' => __DIR__ . '/../..' . '/includes/Settings/Credentials.php',
         'Smaily\\Connect\\Settings\\EmailDesignWorkflows' => __DIR__ . '/../..' . '/includes/Settings/EmailDesignWorkflows.php',
@@ -144,6 +147,7 @@ class ComposerStaticInitc9bd3d1d72511ce8fa30a9390fed4aef
         'Smaily\\Connect\\Support\\MarketingConsent' => __DIR__ . '/../..' . '/includes/Support/MarketingConsent.php',
         'Smaily\\Connect\\Support\\NumberInput' => __DIR__ . '/../..' . '/includes/Support/NumberInput.php',
         'Smaily\\Connect\\Support\\UpgradeLock' => __DIR__ . '/../..' . '/includes/Support/UpgradeLock.php',
+        'Smaily\\Connect\\Support\\Url' => __DIR__ . '/../..' . '/includes/Support/Url.php',
         'Smaily\\Connect\\Wizard\\EnvDetector' => __DIR__ . '/../..' . '/includes/Wizard/EnvDetector.php',
     );
 

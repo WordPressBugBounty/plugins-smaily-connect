@@ -12,6 +12,8 @@ namespace Smaily\Connect\REST;
 defined( 'ABSPATH' ) || exit;
 
 use Smaily\Connect\Constants;
+use Smaily\Connect\Report\InstallationReport;
+use Smaily\Connect\Report\ReportBuilder;
 use Smaily\Connect\Settings\RecEngineSettings;
 use Smaily\Connect\Smaily\RecEngine\Backfill\CatalogImportOnConnect;
 use Smaily\Connect\Smaily\RecEngine\ApiException;
@@ -71,20 +73,32 @@ class RecEngineEndpoint {
 	private $on_connected;
 
 	/**
+	 * The installation report (CON-290), built on demand: a connect
+	 * schedules a `setup_saved` snapshot, and a disconnect sends the
+	 * `disconnected` event before the key is deleted. Null sends nothing.
+	 *
+	 * @var (callable(): InstallationReport)|null
+	 */
+	private $report_factory;
+
+	/**
 	 * @param callable(): SetupExchange                              $exchange_factory
 	 * @param callable(string $api_key, string $base_url): Client    $client_factory
 	 * @param callable(): bool                                       $on_connected
+	 * @param (callable(): InstallationReport)|null                  $report_factory
 	 */
 	public function __construct(
 		RecEngineSettings $settings,
 		callable $exchange_factory,
 		callable $client_factory,
-		callable $on_connected
+		callable $on_connected,
+		?callable $report_factory = null
 	) {
 		$this->settings         = $settings;
 		$this->exchange_factory = $exchange_factory;
 		$this->client_factory   = $client_factory;
 		$this->on_connected     = $on_connected;
+		$this->report_factory   = $report_factory;
 	}
 
 	public function register(): void {
@@ -194,6 +208,10 @@ class RecEngineEndpoint {
 			case ExchangeResult::KIND_SUCCESS:
 				$this->settings->store( $result );
 				$import_started = ( $this->on_connected )();
+				// Connecting is a setup save the report tells (CON-290).
+				if ( $this->report_factory !== null ) {
+					( $this->report_factory )()->setup_saved();
+				}
 				return new WP_REST_Response(
 					array(
 						'connected'                 => true,
@@ -225,6 +243,20 @@ class RecEngineEndpoint {
 						'connected' => false,
 						'error'     => 'token_not_found',
 						'message'   => __( 'Setup token not recognised. Verify the URL is correct.', 'smaily-connect' ),
+					),
+					400
+				);
+
+			case ExchangeResult::KIND_ACCOUNT_MISMATCH:
+				return new WP_REST_Response(
+					array(
+						'connected' => false,
+						'error'     => 'smaily_account_mismatch',
+						'message'   => sprintf(
+							/* translators: %s: the Smaily account (subdomain) of the Campaign Intelligence store the setup link is for. */
+							__( 'This setup link is for the Campaign Intelligence store of another Smaily account (%s), so the connection was not saved. The link is now used up: ask Smaily for a new setup link for this store\'s Smaily account.', 'smaily-connect' ),
+							$result->smaily_subdomain
+						),
 					),
 					400
 				);
@@ -283,11 +315,17 @@ class RecEngineEndpoint {
 		try {
 			$result = $client->ping();
 		} catch ( ApiException $e ) {
+			// The engine's code, never its message, which can name a
+			// customer (CON-301).
 			return new WP_REST_Response(
 				array(
 					'ok'        => false,
 					'error'     => $e->error_code(),
-					'message'   => $e->getMessage(),
+					'message'   => sprintf(
+						/* translators: %s: the error code Smaily Campaign Intelligence answered with, e.g. "network_error". */
+						__( 'The connection check failed (error code: %s).', 'smaily-connect' ),
+						$e->error_code()
+					),
 					'requestId' => $e->request_id(),
 				),
 				502
@@ -306,6 +344,10 @@ class RecEngineEndpoint {
 	}
 
 	public function disconnect( WP_REST_Request $request ): WP_REST_Response {
+		// Before the key goes, with the Smaily connections that stay (CON-290).
+		if ( $this->report_factory !== null && $this->settings->is_connected() ) {
+			( $this->report_factory )()->send_event( ReportBuilder::EVENT_DISCONNECTED, array(), true );
+		}
 		$this->settings->disconnect();
 		return new WP_REST_Response(
 			array( 'disconnected' => true ),

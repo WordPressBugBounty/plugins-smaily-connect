@@ -59,6 +59,9 @@ return array(
     'Smaily\\Connect\\REST\\SettingsEndpoint' => $baseDir . '/includes/REST/SettingsEndpoint.php',
     'Smaily\\Connect\\REST\\TestConnectionEndpoint' => $baseDir . '/includes/REST/TestConnectionEndpoint.php',
     'Smaily\\Connect\\REST\\WorkflowsEndpoint' => $baseDir . '/includes/REST/WorkflowsEndpoint.php',
+    'Smaily\\Connect\\Report\\ConnectionHealth' => $baseDir . '/includes/Report/ConnectionHealth.php',
+    'Smaily\\Connect\\Report\\InstallationReport' => $baseDir . '/includes/Report/InstallationReport.php',
+    'Smaily\\Connect\\Report\\ReportBuilder' => $baseDir . '/includes/Report/ReportBuilder.php',
     'Smaily\\Connect\\Settings\\CredentialSet' => $baseDir . '/includes/Settings/CredentialSet.php',
     'Smaily\\Connect\\Settings\\Credentials' => $baseDir . '/includes/Settings/Credentials.php',
     'Smaily\\Connect\\Settings\\EmailDesignWorkflows' => $baseDir . '/includes/Settings/EmailDesignWorkflows.php',
@@ -129,5 +132,6 @@ return array(
     'Smaily\\Connect\\Support\\MarketingConsent' => $baseDir . '/includes/Support/MarketingConsent.php',
     'Smaily\\Connect\\Support\\NumberInput' => $baseDir . '/includes/Support/NumberInput.php',
     'Smaily\\Connect\\Support\\UpgradeLock' => $baseDir . '/includes/Support/UpgradeLock.php',
+    'Smaily\\Connect\\Support\\Url' => $baseDir . '/includes/Support/Url.php',
     'Smaily\\Connect\\Wizard\\EnvDetector' => $baseDir . '/includes/Wizard/EnvDetector.php',
 );

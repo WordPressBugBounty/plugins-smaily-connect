@@ -408,7 +408,7 @@ abstract class AbstractBackfillJob implements BackfillJobInterface {
 			$this->table_name(),
 			array(
 				'status'        => BackfillJobInterface::STATUS_FAILED,
-				'error_message' => sprintf( '%s at %s:%d', get_class( $e ), basename( $e->getFile() ), $e->getLine() ),
+				'error_message' => \Smaily\Connect\Support\DebugLog::where( $e ),
 			),
 			array(
 				'id'     => $job_id,
@@ -500,8 +500,19 @@ abstract class AbstractBackfillJob implements BackfillJobInterface {
 
 	/** Whether this import's state row is `running` — queued or mid-walk — and not stalled. */
 	public function is_running(): bool {
-		$row = self::read_state( $this->job_type() );
-		return is_array( $row ) && $row['status'] === BackfillJobInterface::STATUS_RUNNING && ! self::is_stalled( $this->job_type(), $row );
+		return self::is_live( $this->job_type(), self::read_state( $this->job_type() ) );
+	}
+
+	/**
+	 * Whether a state row is an import that runs now (queued or mid-walk) and
+	 * has not stalled.
+	 *
+	 * @param array<string, mixed>|false|null $row A state row from read_state().
+	 */
+	public static function is_live( string $job_type, array|false|null $row ): bool {
+		return is_array( $row )
+			&& ( $row['status'] ?? '' ) === BackfillJobInterface::STATUS_RUNNING
+			&& ! self::is_stalled( $job_type, $row );
 	}
 
 	/**
@@ -527,6 +538,36 @@ abstract class AbstractBackfillJob implements BackfillJobInterface {
 		}
 
 		return ! as_has_scheduled_action( BackfillJobInterface::TICK_HOOK, array( 'job_type' => $job_type ) );
+	}
+
+	/**
+	 * Whether an action of $hook waits in Action Scheduler — pending, not
+	 * the one that runs now (CON-285). A check that re-arms itself asks
+	 * this: as_next_scheduled_action() answers `true` both for a running
+	 * action and for a pending async one, so it cannot tell "only I run"
+	 * from "another copy waits", and a second copy was queued.
+	 *
+	 * @param array<int|string, mixed>|null $args Only an action with exactly
+	 *                                            these args; null = any args.
+	 */
+	public static function action_pending( string $hook, string $group, ?array $args = null ): bool {
+		if ( ! function_exists( 'as_get_scheduled_actions' ) ) {
+			return false;
+		}
+
+		$query = array(
+			'hook'     => $hook,
+			'group'    => $group,
+			'status'   => 'pending', // ActionScheduler_Store::STATUS_PENDING.
+			'per_page' => 1,
+		);
+		if ( $args !== null ) {
+			$query['args'] = $args;
+		}
+
+		$ids = as_get_scheduled_actions( $query, 'ids' );
+
+		return is_array( $ids ) && $ids !== array();
 	}
 
 	protected function table_name(): string {

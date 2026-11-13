@@ -39,6 +39,16 @@ class Client {
 	/** Smaily's `{code, message}` reply code for a request it accepted. */
 	public const CODE_OK = 101;
 
+	/**
+	 * Fired after every answer (CON-290): the account's subdomain, '' or
+	 * the RefusalReason code (for a 2xx write its body code refused, the
+	 * code refused_write_code() names), the HTTP method and the endpoint.
+	 * Report\ConnectionHealth listens. It never carries a customer
+	 * identifier: every endpoint is a fixed name (`contact`,
+	 * `autoresponder`, …); an address goes only in the query or body.
+	 */
+	public const RESULT_HOOK = 'smaily_connect_smaily_api_result';
+
 	private string $subdomain;
 	private string $username;
 	private string $password;
@@ -357,10 +367,13 @@ class Client {
 			$response     = wp_remote_post( $url, $args );
 		}
 
+		// The Event Log and the row's error keep codes only, never a message
+		// text: the transport's or Smaily's can name the contact (CON-301).
 		if ( is_wp_error( $response ) ) {
-			$this->last_exchange['response'] = array( 'error' => $response->get_error_message() );
+			$this->last_exchange['response'] = array( 'error' => $response->get_error_code() );
+			$this->announce_result( RefusalReason::UNREACHABLE, $method, $endpoint );
 			throw new ApiException(
-				'Smaily HTTP transport error: ' . $response->get_error_message(),
+				'Smaily HTTP transport error: ' . $response->get_error_code(),
 				0
 			);
 		}
@@ -370,7 +383,7 @@ class Client {
 
 		$this->last_exchange['response'] = array(
 			'http' => $code,
-			'body' => $body,
+			'body' => is_array( $body ) ? array_diff_key( $body, array( 'message' => true ) ) : $body,
 		);
 
 		if ( $code < 200 || $code >= 300 ) {
@@ -381,7 +394,7 @@ class Client {
 				? (int) $body['code']
 				: null;
 
-			throw new ApiException(
+			$exception = new ApiException(
 				sprintf(
 					'Smaily API returned HTTP %d for %s %s%s',
 					$code,
@@ -390,12 +403,53 @@ class Client {
 					$smaily_code !== null ? sprintf( ' (Smaily code %d)', $smaily_code ) : ''
 				),
 				$code,
-				$this->retry_after_seconds( $response ),
+				self::retry_after_seconds( $response ),
 				$smaily_code
 			);
+			$this->announce_result( RefusalReason::classify( $exception ), $method, $endpoint );
+			throw $exception;
 		}
 
+		$this->announce_result( $method === 'POST' ? self::refused_write_code( $this->last_exchange ) : '', $method, $endpoint );
+
 		return $body;
+	}
+
+	/**
+	 * The code a 2xx reply to a write announces (pre-3.22.0 audit L2): ''
+	 * unless its `{code, message}` body refuses the write. The body code is
+	 * read as the flushers read it (RetryPolicy, PRO-3862): 227 is
+	 * plan_blocked, a code a retry can pass is unreachable, any other is the
+	 * `permanent_envelope_<code>` class the row's failure reason carries.
+	 * Never Smaily's message (CON-301). Only a POST is read — a GET's body
+	 * code is an answer (206 = no such contact), not a refused write. What
+	 * the caller gets back is unchanged.
+	 *
+	 * @param array<string, mixed>|null $exchange The exchange just recorded.
+	 */
+	private static function refused_write_code( ?array $exchange ): string {
+		$code = RetryPolicy::envelope_refusal( $exchange );
+		if ( $code === null ) {
+			return '';
+		}
+		if ( $code === RefusalReason::CODE_PAID_PACKAGE_REQUIRED ) {
+			return RefusalReason::PLAN_BLOCKED;
+		}
+
+		$permanent = RetryPolicy::permanent_envelope( $exchange );
+
+		return $permanent === null ? RefusalReason::UNREACHABLE : (string) strstr( $permanent, ':', true );
+	}
+
+	/**
+	 * Tell the installation report how this account's request went (CON-290,
+	 * RESULT_HOOK): '' or the RefusalReason code, the method and the
+	 * endpoint. The subdomain and a code only, never a credential or a
+	 * message text.
+	 */
+	private function announce_result( string $error_code, string $method, string $endpoint ): void {
+		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.DynamicHooknameFound -- the constant value IS the plugin prefix (smaily_connect_*); PCP can't resolve self::CONST.
+		do_action( self::RESULT_HOOK, $this->subdomain, $error_code, $method, $endpoint );
 	}
 
 	/**
@@ -403,10 +457,9 @@ class Client {
 	 * expressed as an HTTP-date (Smaily sends the delta-seconds form; a date
 	 * falls back to the caller's own backoff rather than being mis-parsed).
 	 *
-	 * @param array<string, mixed> $response A successful wp_remote_* reply (the
-	 *                                       transport-error path throws earlier).
+	 * @param array<string, mixed> $response A wp_remote_* reply, not a WP_Error.
 	 */
-	private function retry_after_seconds( array $response ): ?int {
+	public static function retry_after_seconds( array $response ): ?int {
 		$header = wp_remote_retrieve_header( $response, 'retry-after' );
 		$header = is_array( $header ) ? (string) reset( $header ) : (string) $header;
 
