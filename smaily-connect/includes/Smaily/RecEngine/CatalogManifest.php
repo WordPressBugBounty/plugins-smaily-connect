@@ -12,6 +12,7 @@ namespace Smaily\Connect\Smaily\RecEngine;
 
 use Smaily\Connect\Integrations\WooCommerce\CatalogHookHandler;
 use Smaily\Connect\Settings\RecEngineSettings;
+use Smaily\Connect\Smaily\RecEngine\Backfill\AbstractBackfillJob;
 use Smaily\Connect\Smaily\RecEngine\Backfill\CatalogBackfillJob;
 use Smaily\Connect\Support\DebugLog;
 
@@ -31,10 +32,24 @@ defined( 'ABSPATH' ) || exit;
  * catalog sync sends (a differing key reads to the engine as a deleted
  * product).
  *
+ * A product that cannot be loaded — it throws, or a published one loads as
+ * nothing — is not left out (CON-312): the engine would tombstone it, and
+ * `recommendable=false` comes back only with a §3 upsert. It is listed out
+ * of stock from its database ids (a variable product's published and
+ * private variations, else itself), a debug line names its id with the
+ * error type and place, and the rest of the list is sent — unless more than
+ * MAX_UNLOADABLE_PERCENT of the products the list covers (parent posts, not
+ * skus) could not be loaded: then the row is marked failed with the counts
+ * and nothing is sent, since so many failures point at a fault in the store
+ * that would send the catalog out of stock. A database error
+ * while the list is built (a throw while `$wpdb->last_error` is set,
+ * CON-304's rule) or a multilingual detector that throws still fails the
+ * night: nothing is sent.
+ *
  * A partial or premature list would tombstone real products, so the night is
  * skipped — nothing sent — when the engine refuses the store (PRO-1893), the
- * products import runs or waits to start, or catalog changes still wait in
- * the queue. Those skips write no row and go to the debug log only.
+ * products import runs or waits to start or its state cannot be read
+ * (CON-286), or catalog changes still wait in the queue. Those skips write no row and go to the debug log only.
  *
  * Each night that gets past the skips is ONE `catalog.manifest` Event Log
  * row, written BEFORE the walk (PRO-3987): a run the host kills mid-walk
@@ -62,6 +77,25 @@ class CatalogManifest {
 
 	/** Contract §3c: at most this many items, in one request. */
 	public const MAX_PRODUCTS = 50000;
+
+	/**
+	 * The most products, in percent of the products the list covers, that may
+	 * be listed out of stock because they could not be loaded (CON-312). Over
+	 * it the night is not sent: so many failures point at a fault in the
+	 * store, not at broken products. The same 20% as the engine's own §3c
+	 * truncation guard on removals. Products are parent posts, not skus.
+	 */
+	public const MAX_UNLOADABLE_PERCENT = 20;
+
+	/**
+	 * Whether more than MAX_UNLOADABLE_PERCENT of the products the list
+	 * covers could not be loaded.
+	 *
+	 * @param array{products: int, unloadable: int} $counts
+	 */
+	private static function too_many_unloadable( array $counts ): bool {
+		return $counts['unloadable'] * 100 > $counts['products'] * self::MAX_UNLOADABLE_PERCENT;
+	}
 
 	/** Store-time hour the manifest runs at. */
 	public const RUN_HOUR = 3;
@@ -173,43 +207,32 @@ class CatalogManifest {
 		$how             = self::stopped_by( $this->last_error() );
 
 		if ( $row['phase'] === self::PHASE_SEND ) {
-			$this->queue->mark_failed(
+			$this->fail_row(
 				$row['id'],
 				sprintf(
 					/* translators: %s: how the run was stopped and where, e.g. "PHP time limit at Client.php:210". */
 					__( 'The run was stopped while it sent the product list (%s). The engine may not have received it.', 'smaily-connect' ),
 					$how
-				)
-			);
-			$this->queue->store_exchange(
-				$row['id'],
-				$row['sent'],
-				(string) wp_json_encode(
-					array(
-						'outcome' => 'error',
-						'reason'  => 'run_stopped',
-					)
-				)
+				),
+				array(
+					'outcome' => 'error',
+					'reason'  => 'run_stopped',
+				),
+				$row['sent']
 			);
 			return;
 		}
 
-		$this->queue->mark_failed(
+		$this->fail_row(
 			$row['id'],
 			sprintf(
 				/* translators: %s: how the run was stopped and where, e.g. "PHP time limit at CatalogBackfillJob.php:144". */
 				__( 'Not sent: the run was stopped while it built the product list (%s).', 'smaily-connect' ),
 				$how
-			)
-		);
-		$this->queue->store_exchange(
-			$row['id'],
-			null,
-			(string) wp_json_encode(
-				array(
-					'outcome' => 'skipped',
-					'reason'  => 'run_stopped',
-				)
+			),
+			array(
+				'outcome' => 'skipped',
+				'reason'  => 'run_stopped',
 			)
 		);
 	}
@@ -249,48 +272,58 @@ class CatalogManifest {
 	private function build_and_send( int $id ): void {
 		$limit = $this->max_products();
 		try {
-			$products = $this->catalog->manifest_items( $limit );
+			$products = $this->catalog->manifest_items( $limit, $counts );
 		} catch ( \Throwable $e ) {
 			$this->log_skip( 'building the product list failed: ' . DebugLog::where( $e ) );
-			$this->queue->mark_failed(
+			$this->fail_row(
 				$id,
 				sprintf(
 					/* translators: %s: the error type and where it happened, e.g. "RuntimeException at CatalogBackfillJob.php:144". */
 					__( 'Not sent: building the product list stopped on an unexpected error (%s).', 'smaily-connect' ),
 					DebugLog::where( $e )
-				)
-			);
-			$this->queue->store_exchange(
-				$id,
-				null,
-				(string) wp_json_encode(
-					array(
-						'outcome' => 'skipped',
-						'reason'  => 'build_failed',
-					)
+				),
+				array(
+					'outcome' => 'skipped',
+					'reason'  => 'build_failed',
 				)
 			);
 			return;
 		}
 
 		if ( count( $products ) > $limit ) {
-			$this->queue->mark_failed(
+			$this->fail_row(
 				$id,
 				sprintf(
 					/* translators: %s: the most products the nightly product list can hold, e.g. "50,000". */
 					__( 'Not sent: the store has more than %s products, the most the nightly product list can hold.', 'smaily-connect' ),
 					number_format_i18n( $limit )
+				),
+				array(
+					'outcome' => 'skipped',
+					'reason'  => 'too_many_products',
+					'limit'   => $limit,
 				)
 			);
-			$this->queue->store_exchange(
+			return;
+		}
+
+		if ( self::too_many_unloadable( $counts ) ) {
+			$this->log_skip( sprintf( 'too many products could not be loaded: %d of %d, more than %d%%', $counts['unloadable'], $counts['products'], self::MAX_UNLOADABLE_PERCENT ) );
+			$this->fail_row(
 				$id,
-				null,
-				(string) wp_json_encode(
-					array(
-						'outcome' => 'skipped',
-						'reason'  => 'too_many_products',
-						'limit'   => $limit,
-					)
+				sprintf(
+					/* translators: 1: products that could not be loaded, 2: products in the list, 3: the most that may fail to load, in percent, e.g. "20". */
+					__( 'Not sent: %1$s of %2$s products could not be loaded, more than %3$s%%. The list would have marked them all out of stock.', 'smaily-connect' ),
+					number_format_i18n( $counts['unloadable'] ),
+					number_format_i18n( $counts['products'] ),
+					self::MAX_UNLOADABLE_PERCENT
+				),
+				array(
+					'outcome'       => 'skipped',
+					'reason'        => 'too_many_unloadable',
+					'unloadable'    => $counts['unloadable'],
+					'products'      => $counts['products'],
+					'limit_percent' => self::MAX_UNLOADABLE_PERCENT,
 				)
 			);
 			return;
@@ -309,15 +342,16 @@ class CatalogManifest {
 			return;
 		} catch ( \Throwable $e ) {
 			$this->log_skip( 'the send failed: ' . DebugLog::where( $e ) );
-			$this->queue->mark_failed(
+			$this->fail_row(
 				$id,
 				sprintf(
 					/* translators: %s: the error type and where it happened, e.g. "TypeError at Client.php:210". */
 					__( 'The send stopped on an unexpected error (%s).', 'smaily-connect' ),
 					DebugLog::where( $e )
-				)
+				),
+				array( 'outcome' => 'error' ),
+				$sent
 			);
-			$this->queue->store_exchange( $id, $sent, (string) wp_json_encode( array( 'outcome' => 'error' ) ) );
 			return;
 		}
 
@@ -335,6 +369,18 @@ class CatalogManifest {
 				)
 			)
 		);
+	}
+
+	/**
+	 * Marks the night's row $id failed with $message, then stores its
+	 * exchange: the request it sent ($sent, null when nothing was sent) and
+	 * $exchange as its response.
+	 *
+	 * @param array<string, mixed> $exchange
+	 */
+	private function fail_row( int $id, string $message, array $exchange, ?string $sent = null ): void {
+		$this->queue->mark_failed( $id, $message );
+		$this->queue->store_exchange( $id, $sent, (string) wp_json_encode( $exchange ) );
 	}
 
 	/**
@@ -359,7 +405,11 @@ class CatalogManifest {
 		if ( ! $this->settings->sending_allowed() ) {
 			return 'the engine connection is missing or refuses this store';
 		}
-		if ( $this->import_active() ) {
+		$import_active = $this->import_active();
+		if ( $import_active === null ) {
+			return 'the products import state cannot be read';
+		}
+		if ( $import_active ) {
 			return 'the products import is running or waiting to start';
 		}
 		if ( $this->catalog_changes_waiting() ) {
@@ -385,9 +435,16 @@ class CatalogManifest {
 		return $this->queue->enqueue( self::EVENT_TYPE, '', array() );
 	}
 
-	/** The products import's state row is `running` from start() — queued or mid-walk. */
-	protected function import_active(): bool {
-		return $this->catalog->is_running();
+	/**
+	 * Whether the products import runs — its state row is `running` from
+	 * start(), queued or mid-walk, and not stalled — or null when the row
+	 * cannot be read (CON-286): that is no "not running", so the night is
+	 * skipped.
+	 */
+	protected function import_active(): ?bool {
+		$state = AbstractBackfillJob::read_state( $this->catalog->job_type() );
+
+		return $state === false ? null : AbstractBackfillJob::is_live( $this->catalog->job_type(), $state );
 	}
 
 	protected function catalog_changes_waiting(): bool {
