@@ -98,6 +98,7 @@ class ComposerStaticInitc9bd3d1d72511ce8fa30a9390fed4aef
         'Smaily\\Connect\\Smaily\\DiscountCodeIssuer' => __DIR__ . '/../..' . '/includes/Smaily/DiscountCodeIssuer.php',
         'Smaily\\Connect\\Smaily\\EventQueue' => __DIR__ . '/../..' . '/includes/Smaily/EventQueue.php',
         'Smaily\\Connect\\Smaily\\Flusher' => __DIR__ . '/../..' . '/includes/Smaily/Flusher.php',
+        'Smaily\\Connect\\Smaily\\PaymentReminderCheck' => __DIR__ . '/../..' . '/includes/Smaily/PaymentReminderCheck.php',
         'Smaily\\Connect\\Smaily\\ProductMatrixBuilder' => __DIR__ . '/../..' . '/includes/Smaily/ProductMatrixBuilder.php',
         'Smaily\\Connect\\Smaily\\RecEngine\\AbstractD6Flusher' => __DIR__ . '/../..' . '/includes/Smaily/RecEngine/AbstractD6Flusher.php',
         'Smaily\\Connect\\Smaily\\RecEngine\\ApiException' => __DIR__ . '/../..' . '/includes/Smaily/RecEngine/ApiException.php',

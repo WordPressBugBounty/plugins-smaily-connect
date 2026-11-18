@@ -20,6 +20,7 @@ use Smaily\Connect\Report\InstallationReport;
 use Smaily\Connect\Report\ReportBuilder;
 use Smaily\Connect\Settings\Credentials;
 use Smaily\Connect\Settings\SetupState;
+use Smaily\Connect\Smaily\CartAbandonmentSweeper;
 use Smaily\Connect\Smaily\ContactSyncMode;
 use Smaily\Connect\Smaily\TransactionalGate;
 use Smaily\Connect\Smaily\TransactionalPayloadBuilder;
@@ -85,6 +86,7 @@ class SettingsEndpoint {
 		'order_confirmation',
 		'shipping_confirmation',
 		'follow_up',
+		'payment_reminder',
 	);
 
 	/**
@@ -408,19 +410,31 @@ class SettingsEndpoint {
 		if ( array_key_exists( 'followUpDelayDays', $data ) ) {
 			$follow_up_delay = TransactionalGate::delay_days_or_null( $data['followUpDelayDays'] );
 			if ( $follow_up_delay === null ) {
-				return $this->error_response(
-					array(
-						array(
-							'field'   => 'followUpDelayDays',
-							'message' => sprintf(
-								/* translators: 1: the shortest delay in days, 2: the longest. */
-								__( 'The follow-up email delay must be a whole number of days from %1$d to %2$d.', 'smaily-connect' ),
-								TransactionalGate::FOLLOW_UP_DELAY_MIN,
-								TransactionalGate::FOLLOW_UP_DELAY_MAX
-							),
-						),
-					),
-					400
+				return $this->field_error(
+					'followUpDelayDays',
+					sprintf(
+						/* translators: 1: the shortest delay in days, 2: the longest. */
+						__( 'The follow-up email delay must be a whole number of days from %1$d to %2$d.', 'smaily-connect' ),
+						TransactionalGate::FOLLOW_UP_DELAY_MIN,
+						TransactionalGate::FOLLOW_UP_DELAY_MAX
+					)
+				);
+			}
+		}
+
+		// The payment reminder's delay (CON-328), checked the same way.
+		$payment_reminder_delay = null;
+		if ( array_key_exists( 'paymentReminderDelayMinutes', $data ) ) {
+			$payment_reminder_delay = TransactionalGate::delay_minutes_or_null( $data['paymentReminderDelayMinutes'] );
+			if ( $payment_reminder_delay === null ) {
+				return $this->field_error(
+					'paymentReminderDelayMinutes',
+					sprintf(
+						/* translators: 1: the shortest delay in minutes, 2: the longest. */
+						__( 'The payment reminder delay must be a whole number of minutes from %1$d to %2$d.', 'smaily-connect' ),
+						TransactionalGate::PAYMENT_REMINDER_DELAY_MIN,
+						TransactionalGate::PAYMENT_REMINDER_DELAY_MAX
+					)
 				);
 			}
 		}
@@ -447,11 +461,34 @@ class SettingsEndpoint {
 			}
 		}
 
+		// The abandoned-cart cutoff (CON-326): a cutoff as long as the cart's
+		// lifetime never sends, so with the reminder on it is refused before
+		// anything is written. With the reminder off the field is hidden, so a
+		// cutoff over the limit blocks nothing: the stored one is left as it is.
+		$cart        = ! empty( $data['abandonedCartEnabled'] );
+		$cutoff      = isset( $data['abandonedCartCutoffMinutes'] ) ? (int) $data['abandonedCartCutoffMinutes'] : 30;
+		$cutoff      = max( 10, $cutoff );
+		$max_cutoff  = CartAbandonmentSweeper::max_cutoff_minutes();
+		$cutoff_fits = $cutoff <= $max_cutoff;
+		if ( $cart && ! $cutoff_fits ) {
+			return $this->error_response(
+				array(
+					array(
+						'field'   => 'abandonedCartCutoffMinutes',
+						'message' => sprintf(
+							/* translators: 1: the shortest cutoff in minutes, 2: the longest. */
+							__( 'The abandoned-cart cutoff time must be from %1$d to %2$d minutes. A longer cutoff would send no reminder.', 'smaily-connect' ),
+							10,
+							$max_cutoff
+						),
+					),
+				),
+				400
+			);
+		}
+
 		$welcome  = ! empty( $data['welcomeEnabled'] );
 		$first    = ! empty( $data['firstOrderEnabled'] );
-		$cart     = ! empty( $data['abandonedCartEnabled'] );
-		$cutoff   = isset( $data['abandonedCartCutoffMinutes'] ) ? (int) $data['abandonedCartCutoffMinutes'] : 30;
-		$cutoff   = max( 10, $cutoff );
 		$mappings = isset( $data['automationMappings'] ) && is_array( $data['automationMappings'] )
 			? $data['automationMappings']
 			: array();
@@ -480,10 +517,13 @@ class SettingsEndpoint {
 				'autoresponder_id' => $existing['autoresponder_id'],
 			)
 		);
-		update_option( self::LEGACY_OPTION_CART_CUTOFF, $cutoff );
+		if ( $cutoff_fits ) {
+			update_option( self::LEGACY_OPTION_CART_CUTOFF, $cutoff );
+		}
 
 		$this->save_transactional_triggers( $data );
 		$this->save_follow_up( $data, $follow_up_delay );
+		$this->save_payment_reminder( $data, $payment_reminder_delay );
 
 		// Replace the mapping table contents in one shot — Settings always
 		// sends the full list it wants persisted, no partial updates.
@@ -577,6 +617,21 @@ class SettingsEndpoint {
 
 		if ( $delay_days !== null ) {
 			update_option( TransactionalGate::OPTION_FOLLOW_UP_DELAY_DAYS, $delay_days );
+		}
+	}
+
+	/**
+	 * The payment reminder (CON-328): its switch and its delay — already
+	 * validated by save_woocommerce(), null when the payload carried none
+	 * (left as stored).
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function save_payment_reminder( array $data, ?int $delay_minutes ): void {
+		update_option( TransactionalGate::TRIGGERS[ TransactionalGate::TRIGGER_PAYMENT_REMINDER ]['toggle_option'], ! empty( $data['paymentReminderEnabled'] ) );
+
+		if ( $delay_minutes !== null ) {
+			update_option( TransactionalGate::OPTION_PAYMENT_REMINDER_DELAY_MINUTES, $delay_minutes );
 		}
 	}
 
@@ -711,6 +766,21 @@ class SettingsEndpoint {
 				'errors' => $errors,
 			),
 			$status
+		);
+	}
+
+	/**
+	 * A 400 that refuses one field's value, before anything is written.
+	 */
+	private function field_error( string $field, string $message ): WP_REST_Response {
+		return $this->error_response(
+			array(
+				array(
+					'field'   => $field,
+					'message' => $message,
+				),
+			),
+			400
 		);
 	}
 }

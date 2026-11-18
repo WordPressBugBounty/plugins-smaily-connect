@@ -54,9 +54,21 @@ final class Constants {
 	public const DOCS_URL = 'https://smaily.com/connect-woo/';
 
 	/**
+	 * Where a store with no Smaily account creates one (CON-321; Erkki's URL
+	 * "for now", 2026-11-17 — change it here when Smaily names another).
+	 */
+	public const SIGNUP_URL = 'https://www.sendsmaily.net';
+
+	/**
 	 * REST namespace exposed by the plugin (e.g. /wp-json/smaily-connect/v1/...).
 	 */
 	public const REST_NAMESPACE = 'smaily-connect/v1';
+
+	/**
+	 * The Store API namespace the block checkout's newsletter box sends its
+	 * value under — the checkout-optin block's own identifier.
+	 */
+	public const CHECKOUT_OPTIN_NAMESPACE = 'smaily-checkout-optin';
 
 	/**
 	 * Option key holding the schema version run by DB\Migrator.

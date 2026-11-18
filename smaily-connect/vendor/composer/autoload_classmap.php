@@ -83,6 +83,7 @@ return array(
     'Smaily\\Connect\\Smaily\\DiscountCodeIssuer' => $baseDir . '/includes/Smaily/DiscountCodeIssuer.php',
     'Smaily\\Connect\\Smaily\\EventQueue' => $baseDir . '/includes/Smaily/EventQueue.php',
     'Smaily\\Connect\\Smaily\\Flusher' => $baseDir . '/includes/Smaily/Flusher.php',
+    'Smaily\\Connect\\Smaily\\PaymentReminderCheck' => $baseDir . '/includes/Smaily/PaymentReminderCheck.php',
     'Smaily\\Connect\\Smaily\\ProductMatrixBuilder' => $baseDir . '/includes/Smaily/ProductMatrixBuilder.php',
     'Smaily\\Connect\\Smaily\\RecEngine\\AbstractD6Flusher' => $baseDir . '/includes/Smaily/RecEngine/AbstractD6Flusher.php',
     'Smaily\\Connect\\Smaily\\RecEngine\\ApiException' => $baseDir . '/includes/Smaily/RecEngine/ApiException.php',

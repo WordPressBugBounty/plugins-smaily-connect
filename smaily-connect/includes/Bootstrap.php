@@ -64,6 +64,7 @@ use Smaily\Connect\Smaily\RecEngine\Backfill\OrderBackfillJob;
 use Smaily\Connect\Smaily\Client;
 use Smaily\Connect\Smaily\EventQueue;
 use Smaily\Connect\Smaily\Flusher;
+use Smaily\Connect\Smaily\PaymentReminderCheck;
 use Smaily\Connect\Smaily\RecEngine\CatalogPayloadBuilder;
 use Smaily\Connect\Smaily\RecEngine\CatalogManifest;
 use Smaily\Connect\Smaily\RecEngine\CatalogRemoveFlusher;
@@ -238,6 +239,9 @@ final class Bootstrap {
 		// Transactional-email queue-retry (PRO-1504 Stage 2) — drains rows a
 		// synchronous send_now() attempt left `pending` on its own AS action.
 		add_action( TransactionalFlusher::FLUSH_HOOK, array( $this, 'on_flush_transactional_queue' ) );
+		// The payment reminder's wait (CON-328): queues the reminder when it
+		// ends, only for an order that still waits for payment.
+		add_action( PaymentReminderCheck::HOOK, array( $this, 'on_payment_reminder_check' ), 10, 1 );
 
 		// REST endpoints + the AS callback that drives the backfill loop.
 		add_action( 'rest_api_init', array( $this, 'register_rest_endpoints' ) );
@@ -715,8 +719,23 @@ final class Bootstrap {
 		// Classic checkout posts the typed billing email on every order-review
 		// refresh — the earliest moment a GUEST identity is known.
 		add_action( 'woocommerce_checkout_update_order_review', array( $cart, 'on_checkout_update_order_review' ), 10, 1 );
+		// The billing email posts an order review as it changes (CON-325).
+		add_filter( 'woocommerce_checkout_fields', array( $cart, 'on_checkout_fields' ), 10, 1 );
+		// …and also while the address is still empty (CON-325). After
+		// WooCommerce registers `wc-checkout` (priority 10).
+		add_action( 'wp_enqueue_scripts', array( $cart, 'on_enqueue_scripts' ), 20, 0 );
 		// Block checkout's Store-API twin (cart/update-customer route).
 		add_action( 'woocommerce_store_api_cart_update_customer_from_request', array( $cart, 'on_store_api_update_customer' ), 10, 2 );
+		// The block checkout's newsletter box, sent as the shopper changes it
+		// (PRO-4263).
+		if ( function_exists( 'woocommerce_store_api_register_update_callback' ) ) {
+			woocommerce_store_api_register_update_callback(
+				array(
+					'namespace' => Constants::CHECKOUT_OPTIN_NAMESPACE,
+					'callback'  => array( $cart, 'on_store_api_newsletter_update' ),
+				)
+			);
+		}
 		// A completed order clears the tracker rows (the legacy hook set:
 		// classic + Store API + thank-you).
 		add_action( 'woocommerce_checkout_order_processed', array( $cart, 'on_order_processed' ), 10, 1 );
@@ -805,6 +824,8 @@ final class Bootstrap {
 		// fixed here for order confirmation (PRO-1518).
 		add_action( 'woocommerce_store_api_checkout_order_processed', array( $transactional, 'on_block_checkout_order_processed' ), 10, 1 );
 		add_action( 'woocommerce_order_status_changed', array( $transactional, 'on_order_status_changed' ), 10, 4 );
+		// A status change a person made in wp-admin starts no payment reminder (audit L3).
+		add_action( 'woocommerce_order_edit_status', array( $transactional, 'on_order_edit_status' ), 10, 2 );
 
 		// Rec-engine identity merge (3.7). On login, explicitly bind the
 		// anon-session cookies to the now-known customer (§7) — complementary to
@@ -940,7 +961,7 @@ final class Bootstrap {
 		// recurring row restores it without a re-activation (the other
 		// recurring jobs here follow the same pattern).
 		if ( ! as_has_scheduled_action( 'smly_plus_abandoned_cart', array(), EventQueue::AS_GROUP ) ) {
-			as_schedule_recurring_action( time(), 15 * MINUTE_IN_SECONDS, 'smly_plus_abandoned_cart', array(), EventQueue::AS_GROUP );
+			as_schedule_recurring_action( time(), CartAbandonmentSweeper::SWEEP_INTERVAL_SECONDS, 'smly_plus_abandoned_cart', array(), EventQueue::AS_GROUP );
 		}
 
 		// Rec-engine ingest flush — re-ticks every 60s so a row parked with a
@@ -982,8 +1003,9 @@ final class Bootstrap {
 
 		// Queue janitor — daily retention prune (sent 30d / failed 90d,
 		// filterable) of both durable queues. Daily cadence: retention is
-		// measured in days, and the LIMIT-batched DELETEs drain any backlog
-		// over consecutive runs.
+		// measured in days. A run that leaves a backlog schedules its own
+		// follow-up a minute later (CON-335), with args of its own, so this
+		// check (args `[]`) only ever sees the daily run.
 		if ( ! as_has_scheduled_action( QueueJanitor::HOOK, array(), QueueJanitor::AS_GROUP ) ) {
 			as_schedule_recurring_action( time(), DAY_IN_SECONDS, QueueJanitor::HOOK, array(), QueueJanitor::AS_GROUP );
 		}
@@ -1038,6 +1060,15 @@ final class Bootstrap {
 	 */
 	public function on_flush_transactional_queue(): void {
 		$this->transactional_flusher()->flush();
+	}
+
+	/**
+	 * AS callback for PaymentReminderCheck::HOOK (CON-328).
+	 *
+	 * @param mixed $order_id
+	 */
+	public function on_payment_reminder_check( $order_id = 0 ): void {
+		( new PaymentReminderCheck( $this->transactional_gate(), $this->transactional_flusher() ) )->run( $order_id );
 	}
 
 	/**

@@ -55,6 +55,13 @@ abstract class AbstractD6Flusher {
 	protected $client_factory;
 
 	/**
+	 * Why the current row_to_object() call returned null — a reason code the
+	 * Event Log words for the merchant (CON-330), '' when the skip names none.
+	 * Cleared before each row.
+	 */
+	protected string $skip_reason = '';
+
+	/**
 	 * @param callable(): Client $client_factory Builds a rec-engine Client from the stored
 	 *                                          tenant config (with a small max_attempts).
 	 */
@@ -145,6 +152,7 @@ abstract class AbstractD6Flusher {
 		foreach ( $rows as $row ) {
 			++$stats['processed'];
 			$id = (int) ( $row['id'] ?? 0 );
+			$this->skip_reason = '';
 			try {
 				$object = $this->row_to_object( $row );
 			} catch ( \Throwable $e ) {
@@ -166,7 +174,7 @@ abstract class AbstractD6Flusher {
 				// the skip (nothing was POSTed) so the Event Log doesn't read a
 				// bare "sent" with no trace of what happened (F3-44).
 				$this->queue->mark_sent( $id );
-				$this->queue->store_exchange( $id, null, $this->skip_response() );
+				$this->queue->store_exchange( $id, null, $this->skip_response( $this->skip_reason ) );
 				++$stats['skipped'];
 				continue;
 			}
@@ -325,7 +333,7 @@ abstract class AbstractD6Flusher {
 	 *
 	 * @param array<string, mixed> $error A single errors[] entry.
 	 */
-	private function item_error_message( array $error ): string {
+	protected function item_error_message( array $error ): string {
 		$field = isset( $error['field'] ) ? (string) $error['field'] : '';
 		return sprintf( 'd6_item_error field=%s', $field );
 	}
@@ -389,14 +397,20 @@ abstract class AbstractD6Flusher {
 		return IngestQueue::cap_exchange( $text );
 	}
 
-	/** `last_response` for a terminal-skip row — nothing was POSTed. */
-	private function skip_response(): string {
-		return (string) wp_json_encode(
-			array(
-				'outcome' => 'skipped',
-				'note'    => 'row not in a sendable state (entity gone, no longer a confirmed sale, or no product lines) — nothing was POSTed',
-			)
+	/**
+	 * `last_response` for a terminal-skip row — nothing was POSTed. A reason
+	 * code, when the skip names one, is stored as `reason`: the key
+	 * EventQueue::skip_reason() reads for the Event Log (CON-330).
+	 */
+	private function skip_response( string $reason ): string {
+		$response = array(
+			'outcome' => 'skipped',
+			'note'    => 'row not in a sendable state (entity gone, no longer a confirmed sale, no product lines, or no customer email) — nothing was POSTed',
 		);
+		if ( $reason !== '' ) {
+			$response['reason'] = $reason;
+		}
+		return (string) wp_json_encode( $response );
 	}
 
 	/**
@@ -404,7 +418,7 @@ abstract class AbstractD6Flusher {
 	 *
 	 * @param array<string, mixed>|null $error D6 errors[] entry for a rejected row.
 	 */
-	private function response_json( int $http, string $outcome, ?array $error = null ): string {
+	protected function response_json( int $http, string $outcome, ?array $error = null ): string {
 		$payload = array(
 			'http'    => $http,
 			'outcome' => $outcome,

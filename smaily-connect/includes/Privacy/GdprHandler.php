@@ -18,6 +18,7 @@ use Smaily\Connect\Settings\RecEngineSettings;
 use Smaily\Connect\Smaily\BackfillJob;
 use Smaily\Connect\Smaily\CartSessionStore;
 use Smaily\Connect\Smaily\EventQueue;
+use Smaily\Connect\Smaily\PaymentReminderCheck;
 use Smaily\Connect\Smaily\RecEngine\ApiException;
 use Smaily\Connect\Smaily\RecEngine\Backfill\OrderBackfillJob;
 use Smaily\Connect\Smaily\RecEngine\Client;
@@ -32,7 +33,8 @@ use Smaily\Connect\Smaily\RecEngine\OrderFlusher;
  *
  * Scope is the single authority in docs/DATA_MODEL_GDPR.md — do NOT re-derive:
  *   - EXPORT (conservative, personal data only): engine browse_events,
- *     visitor_tokens, recommendations, email_events, and the engine customer
+ *     visitor_tokens, recommendations, email_events, outcome_events (§6b
+ *     bookings a booking system sent, contract v1.32.0), and the engine customer
  *     record MINUS its decision-logic fields (segment / RFM / engagement etc.
  *     are the engine's classification, a trade secret — not subject-access
  *     data); plus the plugin's own rec-meta markers. NOT WooCommerce order /
@@ -340,6 +342,9 @@ class GdprHandler {
 			'recommendations' => 'Recommendations shown',
 			'email_events'    => 'Email interaction signals',
 			'visitor_tokens'  => 'Visitor tokens',
+			// Contract v1.32.0 §8: bookings and visits a booking system sent to
+			// the same engine store (§6b). This plugin sends none.
+			'outcome_events'  => 'Bookings and visits (Campaign Intelligence)',
 		);
 		foreach ( $sections as $key => $label ) {
 			if ( ! isset( $export[ $key ] ) || ! is_array( $export[ $key ] ) ) {
@@ -520,7 +525,9 @@ class GdprHandler {
 	 * copy, so IngestQueue::delete_for_privacy_request() cannot see it. The
 	 * user's waiting login jobs go too (CON-275): a run would send the
 	 * customer (§4) and bind the visitor token (§7). A new Action Scheduler
-	 * job that carries a user must be cancelled here as well.
+	 * job that carries a user must be cancelled here as well. So do the
+	 * orders' waiting payment-reminder checks (audit L2): WooCommerce keeps an
+	 * order's address on erasure by default, and a check would remind it.
 	 *
 	 * @param int[] $order_ids The ids of every order of the customer (order_ids_for()).
 	 */
@@ -536,6 +543,7 @@ class GdprHandler {
 
 		if ( $order_ids !== array() ) {
 			$deleted += $this->ingest_queue->delete_unsent( OrderFlusher::EVENT_ORDER_UPSERT, $order_ids );
+			$deleted += PaymentReminderCheck::forget_orders( $order_ids );
 		}
 
 		return $deleted > 0;
