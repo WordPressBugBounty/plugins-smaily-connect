@@ -149,6 +149,10 @@ class Client {
 	// `ingest_history_progress`; a connection set up before v1.20.0 has no
 	// such key, so this fallback serves it.
 	public const PATH_INGEST_HISTORY_PROGRESS = '/api/v1/ingest/history/progress';
+	// §21 onboarding (v1.16.0; status v1.34.0, CON-175). No endpoints-map key:
+	// the plugin calls both before it has a connection, so they use these.
+	public const PATH_ONBOARDING_START  = '/api/v1/onboarding/start';
+	public const PATH_ONBOARDING_STATUS = '/api/v1/onboarding/status';
 
 	/** Default in-request retry ceiling — generous for one-shot calls (ping, setup). */
 	public const DEFAULT_MAX_ATTEMPTS = 5;
@@ -687,6 +691,38 @@ class Client {
 		return $this->request_url( 'POST', $this->resolve_url( 'ingest_history_progress', self::PATH_INGEST_HISTORY_PROGRESS ), $body, true );
 	}
 
+	/**
+	 * Is the self-service start open? (§21 "Is the start open?", CON-175.)
+	 * No key and no body: the answer is the same for every store. An admin
+	 * page waits on it, so it is ONE attempt bounded by
+	 * BROWSE_TIMEOUT_SECONDS, no redirect, no retry.
+	 *
+	 * @return array<string, mixed> `{start_open}`.
+	 *
+	 * @throws ApiException On a non-2xx answer or a network failure.
+	 */
+	public function onboarding_status(): array {
+		return $this->request_url( 'GET', $this->base_url . self::PATH_ONBOARDING_STATUS, null, true );
+	}
+
+	/**
+	 * Start Campaign Intelligence for a store with no engine store (§21,
+	 * CON-175). The body carries the Smaily API password, so it is sent from
+	 * the server only and never logged; the client is built without a key.
+	 * The engine checks the login with one Smaily call before it answers, so
+	 * the caller builds this client with one attempt and a longer timeout
+	 * than BROWSE_TIMEOUT_SECONDS. No redirect is followed (request_url()).
+	 *
+	 * @param array<string, string> $body
+	 *
+	 * @return array<string, mixed> `{start_url, expires_at, display?}`.
+	 *
+	 * @throws ApiException On 4xx/5xx (401/403/404/409/429/502 per §21) or a network failure.
+	 */
+	public function onboarding_start( array $body ): array {
+		return $this->request_url( 'POST', $this->base_url . self::PATH_ONBOARDING_START, $body );
+	}
+
 	// ---------------------------------------------------------------
 	// Private request engine.
 	// ---------------------------------------------------------------
@@ -757,7 +793,8 @@ class Client {
 	 *                                                  no redirect, no retry and no Retry-After wait
 	 *                                                  (ingest_browse(), PRO-3620; store_uninstall(),
 	 *                                                  CON-219; console_entry(), CON-228;
-	 *                                                  history_progress(), CON-248).
+	 *                                                  history_progress(), CON-248;
+	 *                                                  onboarding_status(), CON-175).
 	 *
 	 * @return array<string, mixed>
 	 *
@@ -770,6 +807,16 @@ class Client {
 		// Encoded once: every attempt sends the same bytes. An empty body is
 		// the JSON object `{}` (§22), not the list `[]` wp_json_encode() makes.
 		$json = $body !== null ? ( $body === array() ? '{}' : (string) wp_json_encode( $body ) ) : null;
+		// The key-less §21 onboarding calls (CON-175) run before any
+		// connection exists: they never follow a redirect (the start's body
+		// carries the Smaily password, which a 301/307/308 must never resend
+		// elsewhere) and never announce a result (there is no engine
+		// connection whose health they could describe).
+		$onboarding = in_array(
+			$url,
+			array( $this->base_url . self::PATH_ONBOARDING_START, $this->base_url . self::PATH_ONBOARDING_STATUS ),
+			true
+		);
 
 		while ( true ) {
 			++$attempts;
@@ -778,18 +825,21 @@ class Client {
 				'method'  => $method,
 				'timeout' => $single_attempt ? self::BROWSE_TIMEOUT_SECONDS : $this->timeout_seconds,
 				'headers' => array(
-					'Authorization' => 'Bearer ' . $this->api_key,
-					'User-Agent'    => sprintf(
+					'User-Agent' => sprintf(
 						'SmailyConnect-WooPlugin/%s',
 						defined( 'SMAILY_CONNECT_VERSION' ) ? (string) SMAILY_CONNECT_VERSION : '0.0.0'
 					),
 				),
 			);
+			// The §21 onboarding calls have no key (CON-175).
+			if ( $this->api_key !== '' ) {
+				$args['headers']['Authorization'] = 'Bearer ' . $this->api_key;
+			}
 			if ( $json !== null ) {
 				$args['headers']['Content-Type'] = 'application/json';
 				$args['body']                    = $json;
 			}
-			if ( $single_attempt ) {
+			if ( $single_attempt || $onboarding ) {
 				// Each redirect hop would get its own timeout.
 				$args['redirection'] = 0;
 			}
@@ -797,7 +847,9 @@ class Client {
 			$response = wp_remote_request( $url, $args );
 			if ( is_wp_error( $response ) ) {
 				if ( $attempts >= $max_attempts ) {
-					$this->announce_result( 'network_error', $method, $url );
+					if ( ! $onboarding ) {
+						$this->announce_result( 'network_error', $method, $url );
+					}
 					// The WP_Error's code, never its text (CON-301).
 					throw new ApiException(
 						0,
@@ -818,7 +870,9 @@ class Client {
 			$this->check_engine_version( wp_remote_retrieve_header( $response, 'x-engine-version' ) );
 
 			if ( $status >= 200 && $status < 300 ) {
-				$this->announce_result( '', $method, $url );
+				if ( ! $onboarding ) {
+					$this->announce_result( '', $method, $url );
+				}
 				return $decoded;
 			}
 
@@ -840,7 +894,9 @@ class Client {
 
 			$retry_after = $status === 429 ? self::retry_after_of( $decoded, $response ) : 0;
 
-			$this->announce_result( $error_code, $method, $url );
+			if ( ! $onboarding ) {
+				$this->announce_result( $error_code, $method, $url );
+			}
 
 			throw new ApiException( $status, $error_code, $message, $decoded, $retry_after > 0 ? $retry_after : null );
 		}
@@ -850,7 +906,7 @@ class Client {
 	 * Tell the installation report how this request went (CON-290,
 	 * RESULT_HOOK): '' or the error code, the method, and the URL path only
 	 * when it is an `/ingest/` path. A code only, never a message text or a
-	 * customer identifier.
+	 * customer identifier. Not called for the §21 onboarding calls.
 	 */
 	private function announce_result( string $error_code, string $method, string $url ): void {
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.parse_url_parse_url -- wp_parse_url() only adds a PHP < 5.4.7 fallback; the plugin needs PHP 8.0, and this runs on every engine call, unit tests included.
